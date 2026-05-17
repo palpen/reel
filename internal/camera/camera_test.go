@@ -12,8 +12,8 @@ import (
 func djiProfile() config.CameraProfile {
 	return config.CameraProfile{
 		Name:            "DJI Pocket 3",
-		VolumePattern:   "DJI*",
-		DCIMSubdir:      "DCIM",
+		VolumeName:      "DJI Pocket 3",
+		MediaPath:       "DCIM",
 		FilenameRegex:   `^(?P<base>DJI_(?P<ts>\d{14})_\d{4}_[A-Z])\.(?P<ext>MP4|LRF|WAV)$`,
 		TimestampSource: "filename",
 		TimestampGroup:  "ts",
@@ -202,19 +202,17 @@ func TestValidateProfile_MissingRequiredGroups(t *testing.T) {
 }
 
 func TestDetect_MockVolumes(t *testing.T) {
-	// Use a temp dir as a fake /Volumes-like root.
-	// We test the matching logic indirectly by setting up a structure that
-	// would match the VolumePattern via filepath.Glob.
 	dir := t.TempDir()
 
-	// Create a fake DJI volume with DCIM
-	fakeDJI := filepath.Join(dir, "DJI_MINI4PRO")
-	dcim := filepath.Join(fakeDJI, "DCIM")
-	os.MkdirAll(dcim, 0o755)
+	// Create a fake camera volume with a DCIM/100MEDIA tree.
+	fakeVol := filepath.Join(dir, "DJI Pocket 3")
+	mediaDir := filepath.Join(fakeVol, "DCIM")
+	os.MkdirAll(mediaDir, 0o755)
 
-	// Create a profile pointing to our temp dir
+	// Point the profile at the temp dir using an absolute VolumeName.
 	p := djiProfile()
-	p.VolumePattern = filepath.Join(dir, "DJI*")
+	p.VolumeName = fakeVol  // absolute path — Detect treats it as-is
+	p.MediaPath = "DCIM"
 
 	cameras, err := camera.Detect([]config.CameraProfile{p})
 	if err != nil {
@@ -223,15 +221,15 @@ func TestDetect_MockVolumes(t *testing.T) {
 	if len(cameras) == 0 {
 		t.Fatal("expected 1 camera, got 0")
 	}
-	if cameras[0].VolumePath != fakeDJI {
-		t.Errorf("VolumePath = %q, want %q", cameras[0].VolumePath, fakeDJI)
+	if cameras[0].VolumePath != fakeVol {
+		t.Errorf("VolumePath = %q, want %q", cameras[0].VolumePath, fakeVol)
 	}
 }
 
 func TestDetect_NoCameras(t *testing.T) {
 	dir := t.TempDir()
 	p := djiProfile()
-	p.VolumePattern = filepath.Join(dir, "NONEXISTENT*")
+	p.VolumeName = filepath.Join(dir, "NONEXISTENT_VOLUME")
 
 	cameras, err := camera.Detect([]config.CameraProfile{p})
 	if err != nil {
@@ -242,21 +240,35 @@ func TestDetect_NoCameras(t *testing.T) {
 	}
 }
 
-func TestDetect_VolumeWithoutDCIM(t *testing.T) {
+func TestDetect_VolumeWithoutMediaPath(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create a DJI-named volume but without DCIM
-	fakeDJI := filepath.Join(dir, "DJI_NO_DCIM")
-	os.MkdirAll(fakeDJI, 0o755) // no DCIM inside
+	// Volume exists but the configured media path doesn't.
+	fakeVol := filepath.Join(dir, "DJI Pocket 3")
+	os.MkdirAll(fakeVol, 0o755) // volume root exists, but no DCIM inside
 
 	p := djiProfile()
-	p.VolumePattern = filepath.Join(dir, "DJI*")
+	p.VolumeName = fakeVol
+	p.MediaPath = "DCIM"
 
 	cameras, err := camera.Detect([]config.CameraProfile{p})
 	if err != nil {
 		t.Fatalf("Detect: %v", err)
 	}
 	if len(cameras) != 0 {
-		t.Errorf("expected 0 cameras (no DCIM), got %d", len(cameras))
+		t.Errorf("expected 0 cameras (media path missing), got %d", len(cameras))
+	}
+}
+
+func TestDetect_UnconfiguredProfile(t *testing.T) {
+	p := djiProfile()
+	p.VolumeName = "" // wizard hasn't run yet
+
+	cameras, err := camera.Detect([]config.CameraProfile{p})
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if len(cameras) != 0 {
+		t.Errorf("expected 0 cameras for unconfigured profile, got %d", len(cameras))
 	}
 }

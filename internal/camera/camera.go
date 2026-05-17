@@ -30,30 +30,27 @@ type DetectedCamera struct {
 	DCIMPath   string
 }
 
-// Detect finds connected camera volumes for all profiles.
+// Detect finds connected camera volumes for all configured profiles.
+// Each profile must have VolumeName set (configured by the wizard).
 func Detect(cameras []config.CameraProfile) ([]DetectedCamera, error) {
 	var found []DetectedCamera
 	for i := range cameras {
 		p := &cameras[i]
-		// Allow absolute patterns (for testing). Otherwise, scope to /Volumes/.
-		pattern := p.VolumePattern
-		if !filepath.IsAbs(pattern) {
-			pattern = filepath.Join("/Volumes", pattern)
+		if p.VolumeName == "" {
+			continue // not yet configured
 		}
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			return nil, fmt.Errorf("glob %s: %w", p.VolumePattern, err)
+		// Support absolute paths (used in tests); otherwise scope to /Volumes/.
+		volPath := p.VolumeName
+		if !filepath.IsAbs(volPath) {
+			volPath = filepath.Join("/Volumes", p.VolumeName)
 		}
-		for _, vol := range matches {
-			dcim := filepath.Join(vol, p.DCIMSubdir)
-			if _, err := os.Stat(dcim); err == nil {
-				found = append(found, DetectedCamera{
-					Profile:    p,
-					VolumePath: vol,
-					DCIMPath:   dcim,
-				})
-				break // first matching volume per profile
-			}
+		mediaPath := filepath.Join(volPath, p.MediaPath)
+		if _, err := os.Stat(mediaPath); err == nil {
+			found = append(found, DetectedCamera{
+				Profile:    p,
+				VolumePath: volPath,
+				DCIMPath:   mediaPath,
+			})
 		}
 	}
 	return found, nil

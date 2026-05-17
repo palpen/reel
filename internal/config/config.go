@@ -16,8 +16,8 @@ const configFile = "config.json"
 // CameraProfile describes one camera model's file-naming conventions.
 type CameraProfile struct {
 	Name            string   `json:"name"`
-	VolumePattern   string   `json:"volume_pattern"`
-	DCIMSubdir      string   `json:"dcim_subdir"`
+	VolumeName      string   `json:"volume_name"`  // exact macOS volume name, e.g. "DJI Pocket 3"
+	MediaPath       string   `json:"media_path"`   // path to media files relative to volume root, e.g. "DCIM"
 	FilenameRegex   string   `json:"filename_regex"`
 	TimestampSource string   `json:"timestamp_source"`
 	TimestampGroup  string   `json:"timestamp_group"`
@@ -99,22 +99,39 @@ func runWizard(path string) (*Config, error) {
 
 	r := bufio.NewReader(os.Stdin)
 
+	vols, err := mountedVolumes()
+	if err != nil || len(vols) == 0 {
+		vols = []string{} // non-fatal; fall back to free-text entry
+	}
+
+	// Camera volume
+	cameraVolume := pickVolume(r, vols, "Which volume is your camera?")
+	mediaPath := ask(r, "Where on the camera are your media files?", "DCIM")
+
+	// HD volume (exclude the camera from the list)
+	hdVols := without(vols, cameraVolume)
+	hdVolumeName := pickVolume(r, hdVols, "Which volume is your backup HD?")
+	hdDir := ask(r, "What folder on the HD should reel manage?", "Footage")
+
+	// Laptop destination
 	laptopDir := ask(r, "Where should imported footage go on this laptop?",
 		filepath.Join(mustHomeDir(), "Videos", "Footage"))
 
-	hdVolumeName := ask(r, "What is the volume name of your external HD?", "SanDisk4TB")
-
-	hdDir := ask(r, "What folder on the HD should reel manage?", "Footage")
-
 	softDeleteStr := ask(r, "Use soft-delete (move to Trash instead of permanent delete)? [Y/n]", "y")
 	softDelete := !strings.EqualFold(strings.TrimSpace(softDeleteStr), "n")
+
+	cameras := defaultCameraProfiles()
+	if len(cameras) > 0 {
+		cameras[0].VolumeName = cameraVolume
+		cameras[0].MediaPath = mediaPath
+	}
 
 	cfg := &Config{
 		LaptopDir:    laptopDir,
 		HDVolumeName: hdVolumeName,
 		HDDir:        hdDir,
 		SoftDelete:   softDelete,
-		Cameras:      defaultCameras(),
+		Cameras:      cameras,
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -127,8 +144,48 @@ func runWizard(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// mountedVolumes returns the names of volumes currently mounted under /Volumes.
+func mountedVolumes() ([]string, error) {
+	entries, err := os.ReadDir("/Volumes")
+	if err != nil {
+		return nil, err
+	}
+	var vols []string
+	for _, e := range entries {
+		if e.IsDir() {
+			vols = append(vols, e.Name())
+		}
+	}
+	return vols, nil
+}
+
+// pickVolume shows a numbered list of volumes and asks the user to pick one.
+// Falls back to free-text entry if vols is empty.
+func pickVolume(r *bufio.Reader, vols []string, prompt string) string {
+	fmt.Printf("\n  %s\n", prompt)
+	if len(vols) == 0 {
+		fmt.Print("  Volume name: ")
+		line, _ := r.ReadString('\n')
+		return strings.TrimSpace(line)
+	}
+	for i, v := range vols {
+		fmt.Printf("    [%d] %s\n", i+1, v)
+	}
+	for {
+		fmt.Printf("  Enter number (1–%d): ", len(vols))
+		line, _ := r.ReadString('\n')
+		line = strings.TrimSpace(line)
+		n := 0
+		fmt.Sscanf(line, "%d", &n)
+		if n >= 1 && n <= len(vols) {
+			return vols[n-1]
+		}
+		fmt.Printf("  Please enter a number between 1 and %d.\n", len(vols))
+	}
+}
+
 func ask(r *bufio.Reader, prompt, defaultVal string) string {
-	fmt.Printf("  %s\n  [%s]: ", prompt, defaultVal)
+	fmt.Printf("\n  %s\n  [%s]: ", prompt, defaultVal)
 	line, _ := r.ReadString('\n')
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -137,18 +194,30 @@ func ask(r *bufio.Reader, prompt, defaultVal string) string {
 	return line
 }
 
+// without returns vols with target removed.
+func without(vols []string, target string) []string {
+	var out []string
+	for _, v := range vols {
+		if v != target {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 func mustHomeDir() string {
 	h, _ := os.UserHomeDir()
 	return h
 }
 
-// defaultCameras returns built-in camera profiles.
-func defaultCameras() []CameraProfile {
+// defaultCameraProfiles returns built-in camera profile templates.
+// VolumeName and MediaPath are left empty to be filled in by the wizard.
+func defaultCameraProfiles() []CameraProfile {
 	return []CameraProfile{
 		{
 			Name:            "DJI Pocket 3",
-			VolumePattern:   "DJI*",
-			DCIMSubdir:      "DCIM",
+			VolumeName:      "", // set by wizard
+			MediaPath:       "", // set by wizard
 			FilenameRegex:   `^(?P<base>DJI_(?P<ts>\d{14})_\d{4}_[A-Z])\.(?P<ext>MP4|LRF|WAV)$`,
 			TimestampSource: "filename",
 			TimestampGroup:  "ts",
