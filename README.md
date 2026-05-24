@@ -38,6 +38,7 @@ Four commands. One `y`. Card cleared.
 | `reel verify` | Re-hash HD files, refresh verification timestamp |
 | `reel clean` | Soft-delete from camera (only after verified HD copy) |
 | `reel status` | Show state of everything |
+| `reel config` | Re-run the setup wizard with current values pre-filled |
 
 All transfer and delete commands support `--dry-run`. `status` supports `--json`.
 

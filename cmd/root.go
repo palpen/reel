@@ -18,6 +18,7 @@ Commands:
   verify        Re-hash HD files to verify integrity
   clean         Delete camera files that have been safely backed up
   status        Show current state of camera, laptop, and HD
+  config        Edit the reel configuration (paths, volumes, soft-delete)
 
 Global flags:
   --version     Print version and exit
@@ -73,6 +74,12 @@ func Run(args []string, version string) int {
 	case "status":
 		if err := RunStatus(args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "reel status: %v\n", err)
+			return 1
+		}
+		return 0
+	case "config":
+		if err := RunConfig(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "reel config: %v\n", err)
 			return 1
 		}
 		return 0

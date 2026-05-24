@@ -5,6 +5,7 @@ package config
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 )
 
 const configFile = "config.json"
+
+// ErrWizardAborted is returned when the user declines to save at the
+// confirmation step of the wizard.
+var ErrWizardAborted = errors.New("wizard aborted by user")
 
 // CameraProfile describes one camera model's file-naming conventions.
 type CameraProfile struct {
@@ -80,6 +85,14 @@ func Save(cfg *Config) error {
 	return writeJSON(path, cfg)
 }
 
+// EditConfig runs the interactive wizard with the given existing config
+// pre-filled as defaults. Returns the new config on save, or
+// ErrWizardAborted if the user declines to save. Does NOT write to disk;
+// the caller is responsible for calling Save.
+func EditConfig(existing *Config) (*Config, error) {
+	return runInteractiveWizard(existing)
+}
+
 func writeJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -92,46 +105,15 @@ func writeJSON(path string, v any) error {
 	return os.Rename(tmp, path)
 }
 
-// runWizard prompts the user for required config values interactively.
+// runWizard is the first-run entry point. Prompts the user for all config
+// values, then writes the config to path.
 func runWizard(path string) (*Config, error) {
 	fmt.Println("reel: no config found. Running first-time setup.")
 	fmt.Println()
 
-	r := bufio.NewReader(os.Stdin)
-
-	vols, err := mountedVolumes()
-	if err != nil || len(vols) == 0 {
-		vols = []string{} // non-fatal; fall back to free-text entry
-	}
-
-	// Camera volume
-	cameraVolume := pickVolume(r, vols, "Which volume is your camera?")
-	mediaPath := ask(r, "Where on the camera are your media files?", "DCIM")
-
-	// HD volume (exclude the camera from the list)
-	hdVols := without(vols, cameraVolume)
-	hdVolumeName := pickVolume(r, hdVols, "Which volume is your backup HD?")
-	hdDir := ask(r, "What folder on the HD should reel manage?", "Footage")
-
-	// Laptop destination
-	laptopDir := ask(r, "Where should imported footage go on this laptop?",
-		filepath.Join(mustHomeDir(), "Videos", "Footage"))
-
-	softDeleteStr := ask(r, "Use soft-delete (move to Trash instead of permanent delete)? [Y/n]", "y")
-	softDelete := !strings.EqualFold(strings.TrimSpace(softDeleteStr), "n")
-
-	cameras := defaultCameraProfiles()
-	if len(cameras) > 0 {
-		cameras[0].VolumeName = cameraVolume
-		cameras[0].MediaPath = mediaPath
-	}
-
-	cfg := &Config{
-		LaptopDir:    laptopDir,
-		HDVolumeName: hdVolumeName,
-		HDDir:        hdDir,
-		SoftDelete:   softDelete,
-		Cameras:      cameras,
+	cfg, err := runInteractiveWizard(nil)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -142,6 +124,270 @@ func runWizard(path string) (*Config, error) {
 	}
 	fmt.Printf("\nConfig saved to %s\n\n", path)
 	return cfg, nil
+}
+
+func runInteractiveWizard(existing *Config) (*Config, error) {
+	w := newWizardState(existing)
+
+	w.askCameraVolume()
+	w.askMediaPath()
+	w.askHDVolume()
+	w.askHDDir()
+	w.askLaptopDir()
+	w.askSoftDelete()
+
+	accepted, err := w.confirmOrEdit()
+	if err != nil {
+		return nil, err
+	}
+	if !accepted {
+		return nil, ErrWizardAborted
+	}
+	return w.toConfig(existing), nil
+}
+
+// wizardState holds the in-progress wizard answers and shared resources.
+type wizardState struct {
+	r            *bufio.Reader
+	vols         []string
+	cameraVolume string
+	mediaPath    string
+	hdVolumeName string
+	hdDir        string
+	laptopDir    string
+	softDelete   bool
+}
+
+func newWizardState(existing *Config) *wizardState {
+	vols, err := mountedVolumes()
+	if err != nil || vols == nil {
+		vols = []string{}
+	}
+	w := &wizardState{
+		r:          bufio.NewReader(os.Stdin),
+		vols:       vols,
+		softDelete: true,
+	}
+	if existing != nil {
+		if len(existing.Cameras) > 0 {
+			w.cameraVolume = existing.Cameras[0].VolumeName
+			w.mediaPath = existing.Cameras[0].MediaPath
+		}
+		w.hdVolumeName = existing.HDVolumeName
+		w.hdDir = existing.HDDir
+		w.laptopDir = existing.LaptopDir
+		w.softDelete = existing.SoftDelete
+	}
+	return w
+}
+
+func (w *wizardState) askCameraVolume() {
+	w.cameraVolume = pickVolume(w.r, w.vols, "Which volume is your camera?", w.cameraVolume)
+}
+
+func (w *wizardState) askMediaPath() {
+	def := w.mediaPath
+	if def == "" {
+		def = "DCIM"
+	}
+	volumeRoot := filepath.Join("/Volumes", w.cameraVolume)
+	w.mediaPath = askPath(w.r, "Where on the camera are your media files?", def, func(p string) error {
+		return validateCameraMediaPath(volumeRoot, p)
+	})
+}
+
+func (w *wizardState) askHDVolume() {
+	hdVols := without(w.vols, w.cameraVolume)
+	w.hdVolumeName = pickVolume(w.r, hdVols, "Which volume is your backup HD?", w.hdVolumeName)
+}
+
+func (w *wizardState) askHDDir() {
+	def := w.hdDir
+	if def == "" {
+		def = "Footage"
+	}
+	w.hdDir = askPath(w.r, "What folder on the HD should reel manage?", def, nil)
+}
+
+func (w *wizardState) askLaptopDir() {
+	def := w.laptopDir
+	if def == "" {
+		def = filepath.Join(mustHomeDir(), "Videos", "Footage")
+	}
+	w.laptopDir = askPath(w.r, "Where should imported footage go on this laptop?", def, nil)
+}
+
+func (w *wizardState) askSoftDelete() {
+	def := "y"
+	if !w.softDelete {
+		def = "n"
+	}
+	answer := ask(w.r, "Use soft-delete (move to Trash instead of permanent delete)? [Y/n]", def)
+	w.softDelete = !strings.EqualFold(strings.TrimSpace(answer), "n")
+}
+
+func (w *wizardState) toConfig(existing *Config) *Config {
+	var cameras []CameraProfile
+	if existing != nil && len(existing.Cameras) > 0 {
+		cameras = append(cameras, existing.Cameras...)
+	} else {
+		cameras = defaultCameraProfiles()
+	}
+	if len(cameras) > 0 {
+		cameras[0].VolumeName = w.cameraVolume
+		cameras[0].MediaPath = w.mediaPath
+	}
+	return &Config{
+		LaptopDir:    w.laptopDir,
+		HDVolumeName: w.hdVolumeName,
+		HDDir:        w.hdDir,
+		SoftDelete:   w.softDelete,
+		Cameras:      cameras,
+	}
+}
+
+func (w *wizardState) printSummary() {
+	cameraResolved := filepath.Join("/Volumes", w.cameraVolume, w.mediaPath)
+	hdResolved := filepath.Join("/Volumes", w.hdVolumeName, w.hdDir)
+	soft := "no"
+	if w.softDelete {
+		soft = "yes"
+	}
+	fmt.Println()
+	fmt.Println("Review your configuration:")
+	fmt.Println()
+	fmt.Printf("  [1] Camera volume:        %s\n", w.cameraVolume)
+	fmt.Printf("  [2] Camera media path:    %s\n", w.mediaPath)
+	fmt.Printf("                            → %s\n", cameraResolved)
+	fmt.Printf("  [3] HD volume:            %s\n", w.hdVolumeName)
+	fmt.Printf("  [4] HD folder:            %s\n", w.hdDir)
+	fmt.Printf("                            → %s\n", hdResolved)
+	fmt.Printf("  [5] Laptop folder:        %s\n", w.laptopDir)
+	fmt.Printf("  [6] Soft-delete:          %s\n", soft)
+	fmt.Println()
+}
+
+// confirmOrEdit shows the summary in a loop. Returns (true, nil) to save,
+// (false, nil) to abort. The user may also pick a field number to re-edit;
+// in that case the loop continues.
+func (w *wizardState) confirmOrEdit() (bool, error) {
+	for {
+		w.printSummary()
+		fmt.Print("  Save this configuration? [Y/n/<field#>]: ")
+		line, _ := w.r.ReadString('\n')
+		line = strings.ToLower(strings.TrimSpace(line))
+
+		switch line {
+		case "", "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		case "e", "edit":
+			fmt.Print("  Which field number (1-6)? ")
+			pick, _ := w.r.ReadString('\n')
+			w.editField(strings.TrimSpace(pick))
+			continue
+		}
+
+		// Try parsing as a field number.
+		var n int
+		if _, err := fmt.Sscanf(line, "%d", &n); err == nil && n >= 1 && n <= 6 {
+			w.editByNumber(n)
+			continue
+		}
+		fmt.Println("  Please enter Y, n, or a field number (1-6).")
+	}
+}
+
+func (w *wizardState) editField(input string) {
+	var n int
+	if _, err := fmt.Sscanf(input, "%d", &n); err != nil || n < 1 || n > 6 {
+		fmt.Println("  Invalid field number.")
+		return
+	}
+	w.editByNumber(n)
+}
+
+func (w *wizardState) editByNumber(n int) {
+	switch n {
+	case 1:
+		w.askCameraVolume()
+		// Camera volume changed → media path validation is against the new
+		// volume, so re-prompt that too.
+		w.askMediaPath()
+	case 2:
+		w.askMediaPath()
+	case 3:
+		w.askHDVolume()
+	case 4:
+		w.askHDDir()
+	case 5:
+		w.askLaptopDir()
+	case 6:
+		w.askSoftDelete()
+	}
+}
+
+// validateCameraMediaPath checks that volumeRoot/mediaPath exists and is
+// a directory. volumeRoot is typically "/Volumes/<camera-volume>".
+func validateCameraMediaPath(volumeRoot, mediaPath string) error {
+	if volumeRoot == "" || volumeRoot == "/Volumes" {
+		// No volume selected yet (e.g. user skipped the volume picker
+		// because no volumes were mounted); can't validate. Let it through.
+		return nil
+	}
+	full := filepath.Join(volumeRoot, mediaPath)
+	info, err := os.Stat(full)
+	if err != nil {
+		return fmt.Errorf("not found at %s — check the path on your camera", full)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", full)
+	}
+	return nil
+}
+
+// sanitizePath cleans up a user-entered path:
+//   - trims surrounding whitespace
+//   - strips one pair of matched surrounding quotes (single or double)
+//   - expands a leading "~" or "~/" to the user's home directory
+func sanitizePath(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		first, last := s[0], s[len(s)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			s = s[1 : len(s)-1]
+		}
+	}
+	s = strings.TrimSpace(s)
+	if s == "~" {
+		return mustHomeDir()
+	}
+	if strings.HasPrefix(s, "~/") {
+		return filepath.Join(mustHomeDir(), s[2:])
+	}
+	return s
+}
+
+// askPath prompts the user, sanitizes the result, and re-prompts on
+// validator error. validator may be nil.
+func askPath(r *bufio.Reader, prompt, defaultVal string, validator func(string) error) string {
+	for {
+		fmt.Printf("\n  %s\n  [%s]: ", prompt, defaultVal)
+		line, _ := r.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" {
+			line = defaultVal
+		}
+		line = sanitizePath(line)
+		if validator != nil {
+			if err := validator(line); err != nil {
+				fmt.Printf("  ✗ %v\n", err)
+				continue
+			}
+		}
+		return line
+	}
 }
 
 // mountedVolumes returns the names of volumes currently mounted under /Volumes.
@@ -160,24 +406,46 @@ func mountedVolumes() ([]string, error) {
 }
 
 // pickVolume shows a numbered list of volumes and asks the user to pick one.
+// If defaultVal matches one of the listed volumes, pressing enter selects it.
 // Falls back to free-text entry if vols is empty.
-func pickVolume(r *bufio.Reader, vols []string, prompt string) string {
+func pickVolume(r *bufio.Reader, vols []string, prompt, defaultVal string) string {
 	fmt.Printf("\n  %s\n", prompt)
 	if len(vols) == 0 {
-		fmt.Print("  Volume name: ")
-		line, _ := r.ReadString('\n')
-		return strings.TrimSpace(line)
-	}
-	for i, v := range vols {
-		fmt.Printf("    [%d] %s\n", i+1, v)
-	}
-	for {
-		fmt.Printf("  Enter number (1–%d): ", len(vols))
+		if defaultVal != "" {
+			fmt.Printf("  Volume name [%s]: ", defaultVal)
+		} else {
+			fmt.Print("  Volume name: ")
+		}
 		line, _ := r.ReadString('\n')
 		line = strings.TrimSpace(line)
-		n := 0
-		fmt.Sscanf(line, "%d", &n)
-		if n >= 1 && n <= len(vols) {
+		if line == "" {
+			return defaultVal
+		}
+		return line
+	}
+
+	defaultIdx := 0
+	for i, v := range vols {
+		marker := ""
+		if v == defaultVal {
+			marker = "  (current)"
+			defaultIdx = i + 1
+		}
+		fmt.Printf("    [%d] %s%s\n", i+1, v, marker)
+	}
+	for {
+		if defaultIdx > 0 {
+			fmt.Printf("  Enter number (1-%d) [%d]: ", len(vols), defaultIdx)
+		} else {
+			fmt.Printf("  Enter number (1-%d): ", len(vols))
+		}
+		line, _ := r.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" && defaultIdx > 0 {
+			return vols[defaultIdx-1]
+		}
+		var n int
+		if _, err := fmt.Sscanf(line, "%d", &n); err == nil && n >= 1 && n <= len(vols) {
 			return vols[n-1]
 		}
 		fmt.Printf("  Please enter a number between 1 and %d.\n", len(vols))
