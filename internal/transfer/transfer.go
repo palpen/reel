@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/pspenano/reel/internal/display"
 )
 
 const bufSize = 1024 * 1024 // 1MB
@@ -120,16 +122,60 @@ func checkFreeSpace(srcPath, destDir string) error {
 	if err != nil {
 		return fmt.Errorf("stat src: %w", err)
 	}
-	needed := info.Size()
+	return PreflightSpace(destDir, info.Size())
+}
 
+// FreeBytes returns the available bytes on the filesystem containing dir.
+// Returns an error if statfs fails (caller should treat as "unknown").
+func FreeBytes(dir string) (int64, error) {
 	var st unix.Statfs_t
-	if err := unix.Statfs(destDir, &st); err != nil {
-		// Non-fatal: just warn
+	if err := unix.Statfs(dir, &st); err != nil {
+		return 0, fmt.Errorf("statfs %s: %w", dir, err)
+	}
+	return int64(st.Bavail) * int64(st.Bsize), nil
+}
+
+// PreflightSpace returns a descriptive error if destDir has less than needed bytes free.
+// If free space cannot be determined (statfs fails), it returns nil — the per-file
+// check inside Copy is the safety net.
+func PreflightSpace(destDir string, needed int64) error {
+	avail, err := FreeBytes(destDir)
+	if err != nil {
 		return nil
 	}
-	avail := int64(st.Bavail) * int64(st.Bsize)
 	if avail < needed {
-		return fmt.Errorf("insufficient disk space on %s: need %d bytes, have %d", destDir, needed, avail)
+		return fmt.Errorf("insufficient free space at %s: need %s, have %s free",
+			destDir, display.Bytes(needed), display.Bytes(avail))
 	}
 	return nil
+}
+
+// SweepOrphanTmps recursively removes *.tmp files under root.
+// Returns the absolute paths of cleaned files. Errors on individual files are
+// skipped (not returned). If root does not exist, returns (nil, nil).
+//
+// Orphans only appear if a transfer process was killed between fsync and rename.
+// They're safe to delete because the source file still exists and no state record
+// references the .tmp path.
+func SweepOrphanTmps(root string) ([]string, error) {
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return nil, nil
+	}
+	var cleaned []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Ext(path) != ".tmp" {
+			return nil
+		}
+		if rmErr := os.Remove(path); rmErr == nil {
+			cleaned = append(cleaned, path)
+		}
+		return nil
+	})
+	return cleaned, err
 }

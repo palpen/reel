@@ -194,3 +194,116 @@ func TestCopyDestDirCreated(t *testing.T) {
 		t.Errorf("dest file not found: %v", err)
 	}
 }
+
+func TestFreeBytes(t *testing.T) {
+	t.Run("valid dir returns positive", func(t *testing.T) {
+		dir := t.TempDir()
+		n, err := transfer.FreeBytes(dir)
+		if err != nil {
+			t.Fatalf("FreeBytes: %v", err)
+		}
+		if n <= 0 {
+			t.Errorf("FreeBytes = %d, want > 0", n)
+		}
+	})
+	t.Run("missing dir returns error", func(t *testing.T) {
+		_, err := transfer.FreeBytes("/nonexistent/path/that/does/not/exist")
+		if err == nil {
+			t.Fatal("expected error for missing dir")
+		}
+	})
+}
+
+func TestPreflightSpace(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("enough space returns nil", func(t *testing.T) {
+		if err := transfer.PreflightSpace(dir, 1); err != nil {
+			t.Errorf("PreflightSpace(1 byte) = %v, want nil", err)
+		}
+	})
+
+	t.Run("insufficient space returns error", func(t *testing.T) {
+		err := transfer.PreflightSpace(dir, 1<<62)
+		if err == nil {
+			t.Fatal("expected error for absurdly large needed")
+		}
+		msg := err.Error()
+		if !contains(msg, "insufficient free space") {
+			t.Errorf("error = %q, want substring 'insufficient free space'", msg)
+		}
+	})
+
+	t.Run("statfs failure returns nil (unknown is not fatal)", func(t *testing.T) {
+		if err := transfer.PreflightSpace("/nonexistent/path/xyz", 1<<62); err != nil {
+			t.Errorf("PreflightSpace with bad dir = %v, want nil", err)
+		}
+	})
+}
+
+func TestSweepOrphanTmps(t *testing.T) {
+	t.Run("missing root returns nil nil", func(t *testing.T) {
+		cleaned, err := transfer.SweepOrphanTmps("/nonexistent/sweep/root")
+		if err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+		if cleaned != nil {
+			t.Errorf("cleaned = %v, want nil", cleaned)
+		}
+	})
+
+	t.Run("removes nested .tmp files, leaves real files", func(t *testing.T) {
+		root := t.TempDir()
+		// Create nested dirs with mixed .tmp and non-.tmp files
+		subA := filepath.Join(root, "2026-05-27_100000")
+		subB := filepath.Join(root, "2026-05-26_180000")
+		for _, d := range []string{subA, subB} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+		}
+		tmpFiles := []string{
+			filepath.Join(root, "orphan.MP4.tmp"),
+			filepath.Join(subA, "DJI_x.MP4.tmp"),
+			filepath.Join(subB, "DJI_y.LRF.tmp"),
+		}
+		realFiles := []string{
+			filepath.Join(root, "kept.MP4"),
+			filepath.Join(subA, "DJI_x.MP4"),
+			filepath.Join(subB, "notes.txt"),
+		}
+		for _, p := range append(tmpFiles, realFiles...) {
+			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+				t.Fatalf("write %s: %v", p, err)
+			}
+		}
+
+		cleaned, err := transfer.SweepOrphanTmps(root)
+		if err != nil {
+			t.Fatalf("SweepOrphanTmps: %v", err)
+		}
+		if len(cleaned) != len(tmpFiles) {
+			t.Errorf("cleaned %d files, want %d (%v)", len(cleaned), len(tmpFiles), cleaned)
+		}
+
+		for _, p := range tmpFiles {
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Errorf("tmp file still exists: %s", p)
+			}
+		}
+		for _, p := range realFiles {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("real file removed or unreadable: %s (%v)", p, err)
+			}
+		}
+	})
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

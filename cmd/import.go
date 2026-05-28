@@ -41,6 +41,10 @@ func RunImport(args []string) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 
+	if cleaned, _ := transfer.SweepOrphanTmps(cfg.LaptopDir); len(cleaned) > 0 {
+		display.Info("Cleaned %d orphan .tmp file(s) from previous run.", len(cleaned))
+	}
+
 	cameras, err := camera.Detect(cfg.Cameras)
 	if err != nil {
 		return fmt.Errorf("detect cameras: %w", err)
@@ -86,17 +90,31 @@ func RunImport(args []string) error {
 	folderName := minTime.UTC().Format("2006-01-02_150405")
 	destDir := filepath.Join(cfg.LaptopDir, folderName)
 
-	display.Info("Importing %d files to %s", len(toImport), destDir)
+	var totalBytes int64
+	for _, f := range toImport {
+		totalBytes += f.Size
+	}
+	if err := transfer.PreflightSpace(cfg.LaptopDir, totalBytes); err != nil {
+		return err
+	}
+
+	display.Info("Importing %d files (%s) to %s", len(toImport), display.Bytes(totalBytes), destDir)
 
 	var imported, failed int
+	aborted := false
+	remaining := 0
 	for i, f := range toImport {
 		filename := f.BaseName + "." + f.Ext
 		display.Progress("[%d/%d] %s", i+1, len(toImport), filename)
 
 		result, err := transfer.Copy(f.FullPath, destDir, filename, f.RecordedAt, "")
 		if err != nil {
-			display.ClearProgress()
-			display.Error("import %s: %v", filename, err)
+			if abort := handleTransferError(err, filename, filepath.Dir(f.FullPath), destDir); abort {
+				failed++
+				aborted = true
+				remaining = len(toImport) - i - 1
+				break
+			}
 			failed++
 			continue
 		}
@@ -129,11 +147,13 @@ func RunImport(args []string) error {
 	}
 	display.ClearProgress()
 
-	display.Print("Import complete: %d imported, %d failed.", imported, failed)
-
 	// Mirror state to HD if connected
 	mirrorStateToHD(cfg, st)
 
+	if aborted {
+		return fmt.Errorf("aborted after %d imported, %d failed, %d not attempted", imported, failed, remaining)
+	}
+	display.Print("Import complete: %d imported, %d failed.", imported, failed)
 	return nil
 }
 

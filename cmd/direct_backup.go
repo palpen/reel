@@ -41,6 +41,10 @@ func RunDirectBackup(args []string) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 
+	if cleaned, _ := transfer.SweepOrphanTmps(cfg.HDManagedDir()); len(cleaned) > 0 {
+		display.Info("Cleaned %d orphan .tmp file(s) from previous run.", len(cleaned))
+	}
+
 	cameras, err := camera.Detect(cfg.Cameras)
 	if err != nil {
 		return fmt.Errorf("detect cameras: %w", err)
@@ -73,17 +77,32 @@ func RunDirectBackup(args []string) error {
 	}
 
 	hdDir := cfg.HDManagedDir()
-	display.Info("Direct backup of %d files to %s", len(toBackup), hdDir)
+
+	var totalBytes int64
+	for _, f := range toBackup {
+		totalBytes += f.Size
+	}
+	if err := transfer.PreflightSpace(hdDir, totalBytes); err != nil {
+		return err
+	}
+
+	display.Info("Direct backup of %d files (%s) to %s", len(toBackup), display.Bytes(totalBytes), hdDir)
 
 	var backed, failed int
+	aborted := false
+	remaining := 0
 	for i, f := range toBackup {
 		filename := f.BaseName + "." + f.Ext
 		display.Progress("[%d/%d] %s", i+1, len(toBackup), filename)
 
 		result, err := transfer.Copy(f.FullPath, hdDir, filename, f.RecordedAt, "")
 		if err != nil {
-			display.ClearProgress()
-			display.Error("direct_backup %s: %v", filename, err)
+			if abort := handleTransferError(err, filename, filepath.Dir(f.FullPath), hdDir); abort {
+				failed++
+				aborted = true
+				remaining = len(toBackup) - i - 1
+				break
+			}
 			failed++
 			continue
 		}
@@ -118,7 +137,11 @@ func RunDirectBackup(args []string) error {
 	}
 	display.ClearProgress()
 
-	display.Print("Direct backup complete: %d backed up, %d failed.", backed, failed)
 	mirrorStateToHD(cfg, st)
+
+	if aborted {
+		return fmt.Errorf("aborted after %d backed up, %d failed, %d not attempted", backed, failed, remaining)
+	}
+	display.Print("Direct backup complete: %d backed up, %d failed.", backed, failed)
 	return nil
 }

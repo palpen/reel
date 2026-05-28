@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -56,6 +57,45 @@ func Error(format string, args ...any) {
 // Warn writes a warning message to stderr.
 func Warn(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "warn: "+format+"\n", args...)
+}
+
+// Relative formats t as a human-readable duration relative to now.
+// Examples: "just now", "5 minutes ago", "2 hours ago", "yesterday",
+// "3 days ago", "2 weeks ago". For ages > ~30 days, falls back to an
+// absolute date like "2026-04-12".
+func Relative(t time.Time) string {
+	d := time.Since(t)
+	if d < 0 {
+		return "just now"
+	}
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		m := int(d / time.Minute)
+		if m == 1 {
+			return "1 minute ago"
+		}
+		return fmt.Sprintf("%d minutes ago", m)
+	case d < 24*time.Hour:
+		h := int(d / time.Hour)
+		if h == 1 {
+			return "1 hour ago"
+		}
+		return fmt.Sprintf("%d hours ago", h)
+	case d < 48*time.Hour:
+		return "yesterday"
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%d days ago", int(d/(24*time.Hour)))
+	case d < 30*24*time.Hour:
+		w := int(d / (7 * 24 * time.Hour))
+		if w == 1 {
+			return "1 week ago"
+		}
+		return fmt.Sprintf("%d weeks ago", w)
+	default:
+		return t.Local().Format("2006-01-02")
+	}
 }
 
 // Bytes formats a byte count as a human-readable string.
