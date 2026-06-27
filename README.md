@@ -58,7 +58,7 @@ All transfer and delete commands support `--dry-run`. `status` supports `--json`
 
 Any check that fails → that file stays on the card. Files held back are listed with a reason. Nothing is silently skipped.
 
-First-version deletes are soft: files go to `~/.Trash/reel-deleted-<timestamp>/`, recoverable from Finder for 30 days.
+When the camera and your Trash are on the same disk, deletes are soft: files go to `~/.Trash/reel-deleted-<timestamp>/`, recoverable from Finder for 30 days. Camera cards mount as a separate volume, where moving to the Trash is impossible — there `reel` deletes permanently. That is safe because nothing is deleted until it has passed all eight checks against a verified HD backup (to keep the Trash safety net anyway, copy footage to an internal-disk folder first, or set `soft_delete` accordingly).
 
 ## Install
 

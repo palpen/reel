@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -198,6 +199,21 @@ func RunClean(args []string) error {
 		display.Print("  %s", d.file.BaseName+"."+d.file.Ext)
 	}
 
+	// Soft-delete moves files into ~/.Trash via rename, which only works when the
+	// camera and the Trash share a volume. Camera cards mount separately, so fall
+	// back to a permanent delete — safe because every file above passed all eight
+	// checks against a verified HD backup.
+	permanentXVol := false
+	if cfg.SoftDelete {
+		if same, err := trash.SameVolumeAsTrash(toDelete[0].file.FullPath); err == nil && !same {
+			permanentXVol = true
+		}
+	}
+	if permanentXVol {
+		display.Print("\nNote: the camera is on a different volume than ~/.Trash, so these files will be")
+		display.Print("permanently deleted (not recoverable from Trash). All have verified HD backups.")
+	}
+
 	if *dryRun {
 		display.Print("\n--dry-run: no files deleted.")
 		return nil
@@ -222,8 +238,12 @@ func RunClean(args []string) error {
 	for _, d := range toDelete {
 		filename := d.file.BaseName + "." + d.file.Ext
 		var delErr error
-		if cfg.SoftDelete {
+		if cfg.SoftDelete && !permanentXVol {
 			_, delErr = trash.Move(d.file.FullPath, deleteTs)
+			if errors.Is(delErr, trash.ErrCrossDevice) {
+				// Volume check missed it (e.g. an unusual mount); delete permanently.
+				delErr = os.Remove(d.file.FullPath)
+			}
 		} else {
 			delErr = os.Remove(d.file.FullPath)
 		}
@@ -240,7 +260,11 @@ func RunClean(args []string) error {
 		deleted++
 	}
 
-	display.Print("\nClean complete: %d deleted, %d failed.", deleted, failedDel)
+	if permanentXVol {
+		display.Print("\nClean complete: %d permanently deleted, %d failed.", deleted, failedDel)
+	} else {
+		display.Print("\nClean complete: %d deleted, %d failed.", deleted, failedDel)
+	}
 	mirrorStateToHD(cfg, st)
 	return nil
 }
