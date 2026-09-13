@@ -254,6 +254,28 @@ func TestCommandWorkflowsRestore(t *testing.T) {
 			requireBytes(t, filepath.Join(f.card, "clip.MP4"), "video")
 			requireBytes(t, filepath.Join(f.card, "clip.LRF"), "preview")
 			requireBytes(t, filepath.Join(f.card, "clip.WAV"), "audio")
+
+			// A preview first tracked by clean must be transferable after restore.
+			f.cfg.TransferExtensions = []string{"MP4", "LRF", "WAV"}
+			transferRoute := "direct_backup"
+			if route == "import-backup" {
+				transferRoute = "import"
+			}
+			if code := Run([]string{transferRoute}, "test"); code != 0 {
+				t.Fatalf("transfer after restore exit=%d", code)
+			}
+			if route == "import-backup" {
+				if err := RunBackup(nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			requireBytes(t, filepath.Join(f.hd, "Footage", "clip.LRF"), "preview")
+			// The restored identity must still reject a changed preview.
+			f.write(t, filepath.Join(f.card, "clip.LRF"), "changed")
+			if code := Run([]string{transferRoute}, "test"); code != 1 {
+				t.Fatalf("changed preview exit=%d", code)
+			}
+			requireBytes(t, filepath.Join(f.hd, "Footage", "clip.LRF"), "preview")
 		})
 	}
 }

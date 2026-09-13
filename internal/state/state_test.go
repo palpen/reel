@@ -236,6 +236,60 @@ func TestFailedPersistenceDoesNotCommitMemory(t *testing.T) {
 	}
 }
 
+func TestStateSyncFailureRetainsCompleteStateAndRetries(t *testing.T) {
+	for _, step := range []string{"state-file-sync", "state-directory-sync"} {
+		t.Run(step, func(t *testing.T) {
+			path := filepath.Join(realTempDir(t), "state.jsonl")
+			st, err := state.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := makeRow("camera", "clip", "MP4")
+			if err := st.Upsert(row); err != nil {
+				t.Fatal(err)
+			}
+			oldPath := row.LaptopPath
+			row.LaptopPath = "/new/location/clip.MP4"
+			failed := false
+			fault.Hook = func(name string) error {
+				if name == step {
+					failed = true
+					return fmt.Errorf("injected %s", step)
+				}
+				return nil
+			}
+			defer func() { fault.Hook = nil }()
+			if err := st.Upsert(row); err == nil || !failed {
+				t.Fatalf("sync failure missed: %v", err)
+			}
+			if got := st.Get(row.Key()); got.LaptopPath != oldPath {
+				t.Fatal("failed write reported committed in memory")
+			}
+			disk, err := state.Load(path)
+			if err != nil || disk.Len() != 1 {
+				t.Fatalf("state became unreadable: %v", err)
+			}
+			wantPath := oldPath
+			if step == "state-directory-sync" {
+				// Rename has happened, but its durability is uncertain. The
+				// visible file must still contain a complete, valid state.
+				wantPath = row.LaptopPath
+			}
+			if got := disk.Get(row.Key()); got.LaptopPath != wantPath || got.SHA256 != row.SHA256 {
+				t.Fatalf("unexpected state after failure: %+v", got)
+			}
+			fault.Hook = nil
+			if err := st.Upsert(row); err != nil {
+				t.Fatal(err)
+			}
+			disk, err = state.Load(path)
+			if err != nil || disk.Get(row.Key()).LaptopPath != row.LaptopPath {
+				t.Fatalf("retry did not persist state: %v", err)
+			}
+		})
+	}
+}
+
 func TestMirrorMergesHistoryAndRejectsConflicts(t *testing.T) {
 	root := realTempDir(t)
 	a, _ := state.Load(filepath.Join(root, "a.jsonl"))

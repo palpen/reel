@@ -45,6 +45,13 @@ func RunRestore(args []string) error {
 	}
 	for _, row := range st.All() {
 		if row.CameraPath == r.OriginalPath {
+			// Clean can record an untransferred preview without a canonical hash.
+			// Restore has verified its bytes against the journal, so use that
+			// identity for later transfers without claiming any archive copy.
+			if row.Ext == "LRF" && row.SHA256 == "" && row.LaptopPath == "" && row.HDPath == "" {
+				row.SHA256 = r.SHA256
+				row.SizeBytes = r.SizeBytes
+			}
 			row.CleanedAt = nil
 			if err = st.Upsert(row); err != nil {
 				return fmt.Errorf("media restored; state update failed: %w", err)

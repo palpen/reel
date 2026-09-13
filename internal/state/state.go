@@ -222,7 +222,7 @@ func (s *Store) writeTo(path string) error {
 		f.Close()
 		return fmt.Errorf("flush state: %w", err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := syncState(f, "state-file-sync"); err != nil {
 		f.Close()
 		return fmt.Errorf("fsync state: %w", err)
 	}
@@ -232,7 +232,14 @@ func (s *Store) writeTo(path string) error {
 	if err := unix.Renameat(int(dir.Fd()), filepath.Base(tmp), int(dir.Fd()), filepath.Base(path)); err != nil {
 		return err
 	}
-	return dir.Sync()
+	return syncState(dir, "state-directory-sync")
+}
+
+func syncState(f *os.File, checkpoint string) error {
+	if err := fault.Check(checkpoint); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // MirrorTo copies the state to an additional path (e.g., the HD mirror).

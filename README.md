@@ -127,6 +127,9 @@ Cleaning is recoverable-only. Files move into unique folders under
 record with its original path and hash. These folders have no automatic expiry. Restore with
 `reel restore --journal "/Volumes/Camera/.reel-trash/<entry>/recovery.json"`.
 Restoration refuses existing destination files. In Finder, press Cmd+Shift+. to show the hidden recovery folder.
+For an LRF first tracked during cleaning, restore records its verified journal hash
+so it can later be imported or backed up when LRF transfers are enabled. If an older
+build already restored that LRF, rerun the same restore command to repair its state.
 
 Reel never falls back to permanent deletion. Mutations require supported filesystem capabilities; see the validation limits below.
 Recovered files still occupy card space until the recovery folder is removed or
@@ -188,17 +191,23 @@ these archives: old releases do not honor the new locking and preservation proto
 
 ## Filesystems and release validation
 
-Mutations are restricted to APFS/exFAT on macOS and require working flock, exclusive
-rename, file sync, and directory sync. Reel probes exclusive rename before moving
-media and refuses unsupported operations. `.reel-capability-*` directories contain
+Mutations require working flock, exclusive rename, file sync, and directory sync.
+Reel checks APFS/exFAT capabilities before moving media and refuses unsupported
+operations. On the tested macOS 26.5.2 host, APFS passes these checks but exFAT
+rejects exclusive rename: **cleaning an exFAT camera card and publishing to an
+exFAT archive are currently unavailable.** Reading an exFAT card into an APFS
+archive works. `.reel-capability-*` directories contain
 owned empty probe files. Keep lockfiles in place; unlinking them breaks coordination.
 Network filesystems are unsupported.
 
 The fixture suites cover collisions, aliases, interrupted copying, lock handoff,
 state failures, quarantine attacks, and both clean/restore workflows. They do not
 prove removable-drive durability or physical power-loss behavior. The Go 1.22/current
-and Python 3.9/current CI matrix and disposable APFS/exFAT validation must pass before
-release. See [the release validation record](docs/REMEDIATION_VALIDATION.md).
+and Python 3.9/current CI matrix has passed. Disposable-image tests confirm APFS
+workflows and safe rejection on exFAT; exFAT write support and the remaining
+physical-drive validation are still release limitations. Run
+`python3 scripts/validate_disk_images.py` on macOS with DiskManagement access to
+repeat those checks. See [the release validation record](docs/REMEDIATION_VALIDATION.md).
 
 ## Camera profiles
 

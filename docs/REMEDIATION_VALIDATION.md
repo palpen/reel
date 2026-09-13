@@ -1,8 +1,7 @@
 # Media-loss remediation validation
 
-Implementation date: 2026-09-13. This change builds on the pre-existing uncommitted
-cleaning changes. No real camera media, existing archives, user configuration, or
-installed Reel binary were modified during implementation.
+Implementation and follow-up validation date: 2026-09-13. No real camera media,
+existing archives, user configuration, or installed Reel binary were modified.
 
 ## Implemented protections
 
@@ -56,11 +55,14 @@ failure tests, not power-loss tests.
 - Go recovery journals contain source/recovery paths, size, hash, and version;
   `reel restore --journal PATH` refuses collisions and can retry after a successful
   move whose state update failed. Restoration does not require the backup drive.
+  Restoring an untransferred LRF binds its missing canonical hash to the verified
+  journal, allowing later transfers. Existing canonical hashes and archive records
+  remain unchanged. Repeating restore also repairs an older hashless restored row.
 - For old Python manifests, standalone restore accepts the saved identity/size/mtime
   fingerprints; new manifests also contain hashes. New apply refuses conflicting
   helper artifacts. Never run an old unsafe helper merely to bypass that refusal.
 
-## Completed local validation
+## Original local validation
 
 - macOS arm64, Go 1.26.3, cgo enabled: `go test -race -count=1 ./...`.
 - `go vet ./...`.
@@ -69,9 +71,9 @@ failure tests, not power-loss tests.
 - Native build `96d8aab-remediation-00fd057248a9` at `/private/tmp/reel-remediation`; no install.
   The fingerprint covers Go/Python source and module files. Binary argument-rejection checks passed.
 
-## Follow-up review fixes
+## Merged review fixes
 
-The follow-up to PR #2 closes the five independent-review findings:
+PR #3 is merged into PR #2 and closes the original five review findings:
 
 - Backup skips require selected-archive containment and matching volume UUID;
   old-drive or unbound records stop explicitly without replacing history.
@@ -91,33 +93,79 @@ The follow-up to PR #2 closes the five independent-review findings:
   Substitution before movement stops with originals intact; substitution after
   movement keeps the media with its manifest/helper and reports the retained path.
 
-The Go race suite and 19 Python tests pass locally. Scoped independent re-reviews
-confirmed the original findings closed without new actionable findings. This does
-not establish physical power-loss durability or complete the mounted-drive tests.
+The Go race suite and 19 Python tests passed locally. This does not establish
+physical power-loss durability or complete the mounted-drive tests.
 
 The parent PR's full Go 1.22/current × Python 3.9/3.14 CI matrix passed:
 [baseline CI run](https://github.com/palpen/reel/actions/runs/34740091588).
-The follow-up runs the same matrix; its results are attached to its PR.
+The merged branch also passed the full matrix:
+[post-merge CI run](https://github.com/palpen/reel/actions/runs/34740852715).
+
+## PR #2 follow-through
+
+Local validation used macOS 26.5.2 (25F84), arm64, Go 1.26.3, and Python 3.9.6.
+The Go race suite, `go vet ./...`, all 19 Python tests, native build, and
+`git diff --check` passed.
+
+- Reproduced the restored-LRF transfer failure in both complete workflows, then
+  fixed restore to bind only untransferred previews to the verified journal hash.
+  Tests also cover older already-restored rows, changed preview bytes, historical
+  canonical hashes, and hashless records that claim an archive copy.
+- Added failure injection immediately before state-file sync and after atomic
+  replacement, before directory sync. Twelve transfer scenarios cover local and
+  mirrored state in all three transfer commands. Four clean/restore scenarios
+  verify nonzero exits, retained originals or recoveries and journals, and retry.
+  State-store tests distinguish the old file before replacement from the complete
+  new file visible after replacement whose durability is still uncertain.
+
+### Disposable mounted filesystems
+
+Run `python3 scripts/validate_disk_images.py` outside a sandbox that blocks
+DiskManagement. `--filesystem APFS` or `--filesystem ExFAT` limits the run.
+The harness creates 256 MiB sparse images and mountpoints under `/private/tmp`,
+compiles race-enabled test binaries, records results, and detaches its own images.
+Images and logs are retained for inspection.
+
+Command fixtures use actual files on each image but inject camera/archive device
+identities. Separate mounted-volume tests exercise real UUID resolution, reject
+ordinary subdirectories as mount roots, and reject incorrect UUIDs or same-volume
+storage separation. Image tests do not establish physical independence of drives.
+
+The exFAT image exposed a compatibility blocker: exclusive publication returns
+`operation not supported` on this macOS driver. An initial attempt to run the
+complete workflows failed at this capability check; it must not be counted as an
+exFAT workflow pass. The harness now separately verifies refusal before media
+publication or recovery movement, and copying from exFAT into an APFS destination.
+**Cleaning an exFAT camera card or publishing to an exFAT backup remains unavailable.**
+
+The completed run recorded these results at
+`/private/tmp/reel-filesystem-validation-0bruvb25/results.json`; both images detached.
+
+| Filesystem | Result on macOS 26.5.2 |
+|---|---|
+| APFS | Both complete workflows, restored LRF transfers, collision preservation, all 16 command state-sync failure scenarios, real mounted identity, process lock handoff, and Go/Python locking passed. |
+| exFAT | Real mounted identity and lock tests passed. Exclusive rename is unsupported; publication and recovery refused with original bytes intact. Copying the original into APFS passed. Complete exFAT workflows remain unsupported. |
 
 ## Release gates still open
 
 The source changes are not a claim that the full release gate has passed.
 
-1. Require the follow-up branch’s `.github/workflows/safety.yml` matrix to pass.
-   The parent implementation passed the full matrix; local testing uses Go 1.26.3
-   and Python 3.9.6.
-2. Run disposable APFS **and exFAT** disk-image workflows on a macOS host with
-   working DiskManagement. Here `diskutil info -plist /` failed because the
-   DiskManagement framework was unavailable. No exFAT or real mounted-volume
-   identity test could be performed. In particular, verify exFAT directory sync,
-   flock, UUID resolution, and exclusive rename; unsupported operations must stop.
+1. Require `.github/workflows/safety.yml` to pass on each updated PR head. The
+   original implementation and PR #3 merge passed the full matrix.
+2. Resolve the exFAT exclusive-rename compatibility blocker before claiming
+   supported exFAT cleaning or archive publication. Keep unsupported operations
+   failing safely. Disposable images do not replace physical removable-drive tests.
 3. Exercise read-only/full destinations, unmount/substitution between every journal
    transition, separate partitions of one device, APFS physical-store resolution,
    case-insensitive names, and two independently configured clients on one archive.
-4. Complete failure injection for state-sync and disconnect transitions on mounted
-   images. Directory-creation sync failure/retry, copy, recovery, restore, state-save,
-   mirror retry, and cross-language subtree locking are covered by fixture tests.
+4. Complete disconnect tests at journal transitions on mounted images. State-file
+   and state-directory sync, directory creation/retry, copy, recovery, restore,
+   mirror retry, and cross-language subtree locking have deterministic coverage.
 5. Physical power-loss durability remains a separate manual validation exercise.
+
+The same-recording mirror merge can still discard client-local history when
+independently configured clients share an archive. That review finding is deferred
+for the current single-camera, single-desktop use case.
 
 Do not install or release this build as fully remediated until these gates pass.
 Retained partial media or a safely rejected operation is acceptable; lost bytes,
