@@ -59,6 +59,9 @@ func RunDirectBackup(args []string) error {
 		return fmt.Errorf("detect cameras: %w", err)
 	}
 	if len(cameras) == 0 {
+		if err := mirrorStateToHD(cfg, st); err != nil {
+			return fmt.Errorf("no camera; required mirror failed: %w", err)
+		}
 		display.Info("No camera found.")
 		return nil
 	}

@@ -153,9 +153,10 @@ Legacy `.tmp` files are never swept. No automatic recovery cleanup occurs.
 
 Exit codes: `0` means completed work or a legitimate empty selection; `1` means an
 operational failure, partial failure, or cancellation; `2` means invalid arguments or
-configuration. Backup retries perform required state mirroring even when all media are verified
-skips; a missing or failed mirror cannot become a successful no-op. Plain import can work
-with the optional backup drive disconnected.
+configuration. Transfer retries repair the state mirror even when there is no media
+to copy, including when the camera has been disconnected or emptied. A failed mirror
+write on a connected drive returns an error. Plain import can work with the optional
+backup drive disconnected.
 
 ## Install
 

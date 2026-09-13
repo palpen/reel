@@ -52,6 +52,9 @@ func RunImport(args []string) error {
 		return fmt.Errorf("detect cameras: %w", err)
 	}
 	if len(cameras) == 0 {
+		if err := mirrorStateIfHDConnected(cfg, st); err != nil {
+			return err
+		}
 		display.Info("No camera found.")
 		return nil
 	}
@@ -76,6 +79,9 @@ func RunImport(args []string) error {
 		return fmt.Errorf("walk DCIM: %w", err)
 	}
 	if len(files) == 0 {
+		if err := mirrorStateIfHDConnected(cfg, st); err != nil {
+			return err
+		}
 		display.Info("No files found on camera.")
 		return nil
 	}
@@ -111,6 +117,9 @@ func RunImport(args []string) error {
 		toImport = append(toImport, f)
 	}
 	if len(toImport) == 0 {
+		if err := mirrorStateIfHDConnected(cfg, st); err != nil {
+			return err
+		}
 		display.Info("No eligible files to import (already imported or excluded by transfer_extensions).")
 		return nil
 	}
@@ -190,13 +199,8 @@ func RunImport(args []string) error {
 	}
 	display.ClearProgress()
 
-	// Mirror state to HD if connected
-	if _, e := os.Stat(hdRoot(cfg)); e == nil {
-		if e := mirrorStateToHD(cfg, st); e != nil {
-			return e
-		}
-	} else if !errors.Is(e, os.ErrNotExist) {
-		return fmt.Errorf("optional mirror unavailable: %w", e)
+	if err := mirrorStateIfHDConnected(cfg, st); err != nil {
+		return err
 	}
 
 	if aborted {
@@ -206,7 +210,19 @@ func RunImport(args []string) error {
 	return nil
 }
 
-// mirrorStateToHD copies the state file to the HD if it's connected.
+// Imports reconcile their mirror even when no media needs copying. An absent
+// backup drive remains optional; failures on a connected drive are not skipped.
+func mirrorStateIfHDConnected(cfg *config.Config, st *state.Store) error {
+	if _, err := os.Stat(hdRoot(cfg)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("optional mirror unavailable: %w", err)
+	}
+	return mirrorStateToHD(cfg, st)
+}
+
+// mirrorStateToHD merges local state into the configured, mounted backup drive.
 func mirrorStateToHD(cfg *config.Config, st *state.Store) error {
 	if _, err := approvedHD(cfg); err != nil {
 		return err

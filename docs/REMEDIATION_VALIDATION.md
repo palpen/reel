@@ -75,11 +75,15 @@ The follow-up to PR #2 closes the five independent-review findings:
 
 - Backup skips require selected-archive containment and matching volume UUID;
   old-drive or unbound records stop explicitly without replacing history.
-- Backup/direct-backup retries perform required mirror persistence even when all
-  selected media are already copied. Tests cover continued failure and repair.
+- Import, backup, and direct-backup retries perform mirror persistence even when
+  selected media are already copied. Camera transfer retries also repair the mirror
+  after the camera is disconnected, emptied, or excluded by transfer settings.
+  Tests cover continued failure, repair without recopying, and import with the
+  optional backup drive disconnected.
 - Both directory walkers persist parent links before exposing directories for
   mutation, including directories left by a failed attempt. Fresh recovery entries
-  also persist their parents. Injected sync failures preserve camera originals.
+  also persist their parents. Injected sync failures preserve camera originals in
+  DCIM and fail again on retry until the containing directory can be synced.
 - Python resolves a unique managed archive ancestor and locks it for subtree
   selections. Unmarked archives require explicit `--archive-root`; nested or
   conflicting markers fail. Legacy manifests can supply the option at apply/restore.

@@ -233,7 +233,11 @@ func TestRecoveryFailuresNeverDelete(t *testing.T) {
 
 func TestRecoveryRootSyncFailureStopsBeforeMovement(t *testing.T) {
 	root, _ := filepath.EvalSymlinks(t.TempDir())
-	src := filepath.Join(root, "clip.MP4")
+	mediaDir := filepath.Join(root, "DCIM")
+	if err := os.Mkdir(mediaDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(mediaDir, "clip.MP4")
 	if err := os.WriteFile(src, []byte("preserve"), 0600); err != nil {
 		t.Fatal(err)
 	}
