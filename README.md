@@ -65,12 +65,16 @@ blocking the MP4. Transfer exclusions never authorize deleting original audio.
 
 `scripts/lrf_quarantine.py` (Python 3.9+, macOS) has separate `plan`, `apply`, and
 `restore` steps. It only selects DJI `.LRF` files with a nonempty matching `.MP4`
-in the same folder. Use a quarantine directory outside the footage folder, on the
-same drive. Run with reel idle.
+in the same folder. Use a quarantine directory outside the managed archive, on the
+same drive. A selected `--root` can be a subtree: the tool discovers the unique
+managed ancestor from `.reel-protocol.json` and locks that ancestor, matching Go.
+For an archive with no marker, specify `--archive-root` explicitly. Conflicting or
+nested markers are rejected rather than choosing a lock arbitrarily.
 
 ```bash
 python3 scripts/lrf_quarantine.py plan \
   --root "/Volumes/MyDrive/Footage" \
+  --archive-root "/Volumes/MyDrive/Footage" \
   --quarantine "/Volumes/MyDrive/Reel LRF Recovery/session-1" \
   --manifest /tmp/lrf-plan.json \
   --state "$HOME/.config/reel/state.jsonl" \
@@ -86,7 +90,18 @@ or cross-volume operations. The tool verifies content hashes, size, modification
 folder stayed unchanged. Tracked LRF backup paths are cleared while historical
 timestamps and other rows are preserved. Restoration merges those paths back and
 refuses conflicting state edits. Interrupted runs can be resumed or restored using
-the same manifest. Changes to recorded files require review before proceeding.
+the same manifest. Legacy manifests without an archive marker require an explicit
+root when applying or restoring, for example:
+
+```bash
+python3 scripts/lrf_quarantine.py restore /path/to/manifest.json \
+  --archive-root "/Volumes/MyDrive/Footage"
+```
+
+Artifacts and media moves use retained directory handles. If a recovery directory
+is replaced during an operation, Reel stops and reports the retained location;
+it never moves recovery data into the replacement directory. Changes to recorded
+files require review before proceeding.
 
 Quarantined files have no automatic expiry and still occupy disk space. Nothing in
 this tool permanently deletes footage. It does not scan disconnected drives, cloud
@@ -128,15 +143,20 @@ for camera mutations.
 
 Transfers never replace existing archives. An identical destination can be reused
 after current source and destination verification; differing content stops the batch.
-Recorded paths alone never authorize a skip. Missing copies are recreated from a
-verified source; changed canonical originals and ambiguous filenames require review.
+A backup skip requires the recorded path to be inside the selected archive and
+its volume UUID to match. A copy on another drive causes an explicit conflict; the
+existing single-backup history is preserved. Unbound legacy records require
+`reel verify --bind-legacy`. Matching, bound records with missing copies are recreated
+from a verified source; changed canonical originals and ambiguous filenames require review.
 Interrupted `.reel-stage-*` media and `.reel-transfer-*` intents remain in place.
 Legacy `.tmp` files are never swept. No automatic recovery cleanup occurs.
 
 Exit codes: `0` means completed work or a legitimate empty selection; `1` means an
 operational failure, partial failure, or cancellation; `2` means invalid arguments or
-configuration. An attempted state mirror failure is a failure. Plain import can work
-with the optional backup drive disconnected.
+configuration. Transfer retries repair the state mirror even when there is no media
+to copy, including when the camera has been disconnected or emptied. A failed mirror
+write on a connected drive returns an error. Plain import can work with the optional
+backup drive disconnected.
 
 ## Install
 

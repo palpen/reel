@@ -69,12 +69,43 @@ failure tests, not power-loss tests.
 - Native build `96d8aab-remediation-00fd057248a9` at `/private/tmp/reel-remediation`; no install.
   The fingerprint covers Go/Python source and module files. Binary argument-rejection checks passed.
 
+## Follow-up review fixes
+
+The follow-up to PR #2 closes the five independent-review findings:
+
+- Backup skips require selected-archive containment and matching volume UUID;
+  old-drive or unbound records stop explicitly without replacing history.
+- Import, backup, and direct-backup retries perform mirror persistence even when
+  selected media are already copied. Camera transfer retries also repair the mirror
+  after the camera is disconnected, emptied, or excluded by transfer settings.
+  Tests cover continued failure, repair without recopying, and import with the
+  optional backup drive disconnected.
+- Both directory walkers persist parent links before exposing directories for
+  mutation, including directories left by a failed attempt. Fresh recovery entries
+  also persist their parents. Injected sync failures preserve camera originals in
+  DCIM and fail again on retry until the containing directory can be synced.
+- Python resolves a unique managed archive ancestor and locks it for subtree
+  selections. Unmarked archives require explicit `--archive-root`; nested or
+  conflicting markers fail. Legacy manifests can supply the option at apply/restore.
+- Python retains artifact and endpoint directory handles across apply/restore.
+  Substitution before movement stops with originals intact; substitution after
+  movement keeps the media with its manifest/helper and reports the retained path.
+
+The Go race suite and 19 Python tests pass locally. Scoped independent re-reviews
+confirmed the original findings closed without new actionable findings. This does
+not establish physical power-loss durability or complete the mounted-drive tests.
+
+The parent PR's full Go 1.22/current × Python 3.9/3.14 CI matrix passed:
+[baseline CI run](https://github.com/palpen/reel/actions/runs/34740091588).
+The follow-up runs the same matrix; its results are attached to its PR.
+
 ## Release gates still open
 
 The source changes are not a claim that the full release gate has passed.
 
-1. Run `.github/workflows/safety.yml` on Go 1.22/current and Python 3.9/current.
-   Only Go 1.26.3 and Python 3.9.6 were installed in this environment.
+1. Require the follow-up branch’s `.github/workflows/safety.yml` matrix to pass.
+   The parent implementation passed the full matrix; local testing uses Go 1.26.3
+   and Python 3.9.6.
 2. Run disposable APFS **and exFAT** disk-image workflows on a macOS host with
    working DiskManagement. Here `diskutil info -plist /` failed because the
    DiskManagement framework was unavailable. No exFAT or real mounted-volume
@@ -83,9 +114,9 @@ The source changes are not a claim that the full release gate has passed.
 3. Exercise read-only/full destinations, unmount/substitution between every journal
    transition, separate partitions of one device, APFS physical-store resolution,
    case-insensitive names, and two independently configured clients on one archive.
-4. Complete failure injection for state-sync/directory-sync and physical disconnect
-   transitions on mounted images, beyond the deterministic copy, recovery, restore,
-   state-save, mirror-save, and cross-language locking tests already present.
+4. Complete failure injection for state-sync and disconnect transitions on mounted
+   images. Directory-creation sync failure/retry, copy, recovery, restore, state-save,
+   mirror retry, and cross-language subtree locking are covered by fixture tests.
 5. Physical power-loss durability remains a separate manual validation exercise.
 
 Do not install or release this build as fully remediated until these gates pass.

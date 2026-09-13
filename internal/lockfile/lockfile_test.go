@@ -91,7 +91,9 @@ func TestPythonQuarantineHonorsGoArchiveLock(t *testing.T) {
 sys.path.insert(0,sys.argv[1])
 import lrf_quarantine as q
 root=pathlib.Path(sys.argv[2])
-p=dict(root=str(root),states=[],lock=None)
+selected=root/"session"
+selected.mkdir()
+p=dict(root=str(selected),archive_root=str(root),states=[],lock=None)
 try:
     with q.transaction_locks(p):
         sys.exit(42)

@@ -3,7 +3,7 @@
 
 Moves use exclusive same-volume rename. The saved plan supports recovery even if
 interrupted halfway. File identity, size and mtime are checked before/after moves;
-contents are never rewritten. Run with reel idle; a reel lock is held when supplied.
+contents are never rewritten. Apply and restore lock the validated managed archive.
 """
 import argparse
 import contextlib
@@ -16,7 +16,6 @@ import re
 import hashlib
 import stat
 import sys
-import tempfile
 
 
 @contextlib.contextmanager
@@ -33,6 +32,13 @@ def directory(path, create=False):
                 except FileExistsError:
                     pass
             new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            if create:
+                try:
+                    # Retry may encounter a directory left by an earlier failed sync.
+                    os.fsync(fd)
+                except BaseException:
+                    os.close(new)
+                    raise
             os.close(fd)
             fd = new
         yield fd
@@ -47,9 +53,9 @@ def regular(fd):
     return info
 
 
-def fingerprint(path):
+def fingerprint(path, parent_fd=None):
     path = Path(path)
-    with directory(path.parent) as parent:
+    with directory(path.parent) if parent_fd is None else contextlib.nullcontext(parent_fd) as parent:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         try:
             s = regular(fd)
@@ -67,18 +73,18 @@ def fingerprint(path):
             os.close(fd)
 
 
-def check(path, expected):
-    current = fingerprint(path)
+def check(path, expected, parent_fd=None):
+    current = fingerprint(path, parent_fd)
     # Legacy manifests lack hashes; accept metadata only for standalone recovery.
     if any(current.get(k) != v for k, v in expected.items()):
         raise ValueError(f"File changed since planning: {path}")
 
 
-def artifact(path, data, create=True):
+def artifact(path, data, create=True, parent_fd=None):
     """Create exclusively, or reuse an identical regular unaliased artifact."""
     path = Path(path)
     data = data.encode() if isinstance(data, str) else data
-    with directory(path.parent) as parent:
+    with directory(path.parent) if parent_fd is None else contextlib.nullcontext(parent_fd) as parent:
         try:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         except FileNotFoundError:
@@ -116,11 +122,36 @@ def atomic_write(path, data):
         os.fsync(parent)
 
 
-def exclusive_move(src, dst):
+def directory_location(fd, fallback):
+    if sys.platform == 'darwin':
+        try:
+            # Darwin sys/fcntl.h: F_GETPATH = 50, MAXPATHLEN = 1024.
+            return os.fsdecode(fcntl.fcntl(fd, 50, b'\0'*1024).split(b'\0', 1)[0])
+        except OSError:
+            pass
+    return str(fallback)
+
+
+def check_directory(path, fd):
+    try:
+        with directory(path) as current:
+            a, b = os.fstat(fd), os.fstat(current)
+            if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+                return
+    except OSError:
+        pass
+    raise ValueError(f'Directory changed: {path}; retained directory: {directory_location(fd, path)}')
+
+
+def exclusive_move(src, dst, source_fd=None, destination_fd=None):
     if sys.platform != 'darwin':
         raise RuntimeError('Exclusive rename implementation requires macOS')
     src, dst = Path(src), Path(dst)
-    with directory(src.parent) as a, directory(dst.parent) as b:
+    with contextlib.ExitStack() as stack:
+        a = source_fd if source_fd is not None else stack.enter_context(directory(src.parent))
+        b = destination_fd if destination_fd is not None else stack.enter_context(directory(dst.parent))
+        check_directory(src.parent, a)
+        check_directory(dst.parent, b)
         if os.fstat(a).st_dev != os.fstat(b).st_dev:
             raise ValueError('Cross-volume move refused')
         lib = ctypes.CDLL(None, use_errno=True)
@@ -131,6 +162,45 @@ def exclusive_move(src, dst):
             raise OSError(ctypes.get_errno(), f'Exclusive rename failed: {src} -> {dst}')
         os.fsync(b)
         os.fsync(a)
+        check_directory(src.parent, a)
+        check_directory(dst.parent, b)
+
+
+PROTOCOL = '{"version":2,"media_publication":"exclusive","recovery":"retain"}\n'
+
+
+def resolve_archive(root, explicit=None):
+    """Find the unique managed ancestor; an unmarked archive needs an explicit root."""
+    root = Path(root).absolute()
+    with directory(root) as fd:
+        device = os.fstat(fd).st_dev
+    marked = []
+    for candidate in (root, *root.parents):
+        with directory(candidate) as fd:
+            if os.fstat(fd).st_dev != device:
+                break
+            try:
+                marker = os.open('.reel-protocol.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            with os.fdopen(marker, 'rb') as f:
+                regular(f.fileno())
+                if f.read(len(PROTOCOL)+1) != PROTOCOL.encode():
+                    raise ValueError(f'Incompatible archive marker: {candidate}')
+            marked.append(candidate)
+    if len(marked) > 1:
+        raise ValueError('Ambiguous nested archive markers; reconcile archive roots before proceeding')
+    selected = Path(explicit).absolute() if explicit is not None else (marked[0] if marked else None)
+    if selected is None:
+        raise ValueError('No managed archive marker found; specify --archive-root explicitly')
+    if selected != root and selected not in root.parents:
+        raise ValueError('Selection must be inside the managed archive root')
+    if marked and selected != marked[0]:
+        raise ValueError('Explicit archive root conflicts with the managed archive marker')
+    with directory(selected) as fd:
+        if os.fstat(fd).st_dev != device:
+            raise ValueError('Selection and archive are on different devices')
+    return selected
 
 
 def read_rows(path):
@@ -153,11 +223,12 @@ def key(row):
     return (row['camera_profile'], row['base_name'], row['ext'])
 
 
-def plan(root, quarantine, states, lock):
+def plan(root, quarantine, states, lock, archive_root=None):
     root, quarantine = Path(root).absolute(), Path(quarantine).absolute()
     if root.resolve() != root or quarantine.resolve() != quarantine:
         raise ValueError('Root/quarantine must not contain symlinks')
-    if root == quarantine or root in quarantine.parents or quarantine in root.parents:
+    archive_root = resolve_archive(root, archive_root)
+    if archive_root == quarantine or archive_root in quarantine.parents or quarantine in archive_root.parents:
         raise ValueError('Quarantine must be outside the backup folder')
     if quarantine.exists():
         raise ValueError('Use a new quarantine directory')
@@ -209,7 +280,7 @@ def plan(root, quarantine, states, lock):
             if changes:
                 edits.append(dict(key=list(key(row)), before={k: row[k] for k in changes}, after=changes))
         state_plans.append(dict(path=state_path, original=original, edits=edits))
-    return dict(version=1, root=str(root), quarantine=str(quarantine), device=device,
+    return dict(version=1, root=str(root), archive_root=str(archive_root), quarantine=str(quarantine), device=device,
                 lock=lock, entries=entries, untouched=untouched, states=state_plans)
 
 
@@ -254,33 +325,49 @@ def locked(path):
 
 
 @contextlib.contextmanager
-def transaction_locks(p):
+def transaction_locks(p, archive_root=None):
+    selected = resolve_archive(p['root'], archive_root or p.get('archive_root'))
     # Same ordering as Go: local state directories, then shared archive root.
     local = {str(Path(s['path']).parent/'reel.lock') for s in p['states'] if Path(s['path']).name != '.reel-state.jsonl'}
     mirrors = {str(Path(s['path']).parent/'reel.lock') for s in p['states'] if Path(s['path']).name == '.reel-state.jsonl'}
     if p.get('lock'):
         local.add(str(Path(p['lock']).absolute()))
-    archive = str(Path(p['root'])/'.reel-archive.lock')
-    media = str(Path(p['root'])/'reel.lock')
+    archive = str(selected/'.reel-archive.lock')
+    media = str(selected/'reel.lock')
     with contextlib.ExitStack() as stack:
         acquired = set()
         for path in sorted(local) + [archive, media] + sorted(mirrors):
             if path not in acquired:
                 stack.enter_context(locked(path))
                 acquired.add(path)
-        marker = Path(p['root'])/'.reel-protocol.json'
-        artifact(marker, '{"version":2,"media_publication":"exclusive","recovery":"retain"}\n')
-        yield
+        if resolve_archive(p['root'], selected) != selected:
+            raise ValueError('Archive root changed while acquiring locks')
+        artifact(selected/'.reel-protocol.json', PROTOCOL)
+        yield selected
 
 
-def execute(p, restore=False):
-    with transaction_locks(p):
+def execute(p, restore=False, archive_root=None):
+    with transaction_locks(p, archive_root) as archive, contextlib.ExitStack() as handles:
         if p.get('version') != 1:
             raise ValueError('Unsupported manifest version')
         root, quarantine = Path(p['root']), Path(p['quarantine'])
+        pinned = {}
+
+        def pin(path, create=False):
+            path = Path(path)
+            if path not in pinned:
+                pinned[path] = handles.enter_context(directory(path, create=create))
+            return pinned[path]
+
+        def check_pins():
+            for path, fd in pinned.items():
+                check_directory(path, fd)
+
+        pin(archive)
+        pin(root)
         if root.resolve() != root or quarantine.resolve() != quarantine:
             raise ValueError('Symlink in root/quarantine')
-        if root.stat().st_dev != p['device']:
+        if os.fstat(pin(root)).st_dev != p['device']:
             raise ValueError('Backup volume changed; re-plan before continuing')
         # Validate the entire batch and state before moving the first file.
         updates = state_updates(p, restore)
@@ -298,13 +385,17 @@ def execute(p, restore=False):
             check(src if os.path.lexists(src) else dst, entry['fingerprint'])
             if os.path.lexists(src):
                 pending.append((src, dst, entry['fingerprint']))
-        # Preflight every destination parent before the first media move.
+        # Retain all endpoint parents and the recovery root through the entire
+        # transaction. Artifacts and media use these same validated descriptors.
+        recovery_fd = pin(quarantine, create=True) if not restore or pending else None
+        endpoints = []
         for src, dst, expected in pending:
-            with directory(Path(dst).parent, create=True):
-                pass
+            a = pin(Path(src).parent)
+            b = pin(Path(dst).parent, create=True)
+            if os.fstat(a).st_dev != p['device'] or os.fstat(b).st_dev != p['device']:
+                raise ValueError('Endpoint changed device')
+            endpoints.append((src, dst, expected, a, b))
         if not restore:
-            with directory(quarantine, create=True):
-                pass
             manifest = quarantine/'manifest.json'
             artifacts = {
                 manifest: json.dumps(p, indent=2)+'\n',
@@ -315,19 +406,29 @@ def execute(p, restore=False):
                     'python3 "'+str(quarantine/'restore_lrf.py')+'" restore "'+str(manifest)+'"\n'
                     'This refuses overwrites and changes to the recorded files.\n',
             }
-            # A conflict in any artifact fails before creating/reusing the others.
             for path, data in artifacts.items():
-                artifact(path, data, create=False)
+                check_pins()
+                artifact(path, data, create=False, parent_fd=recovery_fd)
             for path, data in artifacts.items():
-                artifact(path, data)
-        for src, dst, expected in pending:
-            check(src, expected)
-            exclusive_move(src, dst)
-            check(dst, expected)
+                check_pins()
+                artifact(path, data, parent_fd=recovery_fd)
+        try:
+            for src, dst, expected, a, b in endpoints:
+                check_pins()
+                check(src, expected, parent_fd=a)
+                exclusive_move(src, dst, source_fd=a, destination_fd=b)
+                check(dst, expected, parent_fd=b)
+                check_pins()
+            check_pins()
+        except (OSError, ValueError) as error:
+            location = directory_location(recovery_fd, quarantine) if recovery_fd is not None else str(quarantine)
+            raise ValueError(f'{error}; recovery material retained at {location}') from error
         for item in p['untouched']:
             check(item['path'], item['fingerprint'])
         for path, data in updates:
+            check_pins()
             atomic_write(path, data)
+        check_pins()
         print(f"{'Restored' if restore else 'Quarantined'} {len(pending)} LRF files; "
               f"verified {len(p['untouched'])} other files unchanged; updated {len(updates)} state files.", flush=True)
 
@@ -338,14 +439,17 @@ def main():
     create = sub.add_parser('plan')
     create.add_argument('--root', required=True)
     create.add_argument('--quarantine', required=True)
+    create.add_argument('--archive-root', help='managed archive root (required when no marker exists)')
     create.add_argument('--manifest', required=True)
     create.add_argument('--state', action='append', default=[])
     create.add_argument('--lock')
     for action in ('apply', 'restore'):
-        sub.add_parser(action).add_argument('manifest')
+        operation = sub.add_parser(action)
+        operation.add_argument('manifest')
+        operation.add_argument('--archive-root', help='managed root for a legacy manifest without archive identity')
     args = parser.parse_args()
     if args.action == 'plan':
-        p = plan(args.root, args.quarantine, args.state, args.lock)
+        p = plan(args.root, args.quarantine, args.state, args.lock, args.archive_root)
         with open(args.manifest, 'x') as f:
             json.dump(p, f, indent=2)
             f.write('\n')
@@ -353,7 +457,7 @@ def main():
                               protected_files=len(p['untouched']), state_rows=[len(s['edits']) for s in p['states']],
                               manifest=args.manifest), indent=2))
     else:
-        execute(json.loads(Path(args.manifest).read_text()), restore=args.action == 'restore')
+        execute(json.loads(Path(args.manifest).read_text()), restore=args.action == 'restore', archive_root=args.archive_root)
 
 
 if __name__ == '__main__':

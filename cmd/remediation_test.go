@@ -278,3 +278,151 @@ func TestStateAndMirrorFailureDoNotReportSuccess(t *testing.T) {
 		})
 	}
 }
+
+func TestBackupSkipRequiresSelectedArchive(t *testing.T) {
+	for _, route := range []string{"backup", "direct_backup"} {
+		for _, mismatch := range []string{"outside-root", "wrong-uuid", "unbound"} {
+			t.Run(route+"/"+mismatch, func(t *testing.T) {
+				f := commands(t)
+				f.write(t, filepath.Join(f.card, "clip.MP4"), "original")
+				if err := RunImport(nil); err != nil {
+					t.Fatal(err)
+				}
+				if err := RunDirectBackup(nil); err != nil {
+					t.Fatal(err)
+				}
+				st, err := state.Load(filepath.Join(f.local, "state.jsonl"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := st.All()[0]
+				if mismatch == "outside-root" {
+					r.HDPath = filepath.Join(f.root, "old-drive", "clip.MP4")
+					f.write(t, r.HDPath, "original")
+				} else if mismatch == "wrong-uuid" {
+					r.HDVolumeUUID = "old-drive"
+				} else {
+					r.HDVolumeUUID = ""
+				}
+				if err = st.Upsert(r); err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.ReadFile(st.Path())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if code := Run([]string{route}, "test"); code != 1 {
+					t.Fatalf("identity conflict exit=%d", code)
+				}
+				requireBytes(t, st.Path(), string(before))
+				requireBytes(t, r.HDPath, "original")
+			})
+		}
+	}
+}
+
+func TestTransferRetryRepairsMirror(t *testing.T) {
+	for _, route := range []string{"import", "backup", "direct_backup"} {
+		selections := []string{"unchanged"}
+		if route != "backup" {
+			selections = append(selections, "no-camera", "empty-card", "excluded")
+		}
+		for _, selection := range selections {
+			t.Run(route+"/"+selection, func(t *testing.T) {
+				f := commands(t)
+				src := filepath.Join(f.card, "clip.MP4")
+				f.write(t, src, "original")
+				if route == "backup" {
+					if err := RunImport(nil); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Remove(hdState(f.cfg)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fault.Hook = func(name string) error {
+					if name == "mirror-save" {
+						return fmt.Errorf("injected mirror failure")
+					}
+					return nil
+				}
+				defer func() { fault.Hook = nil }()
+				if code := Run([]string{route}, "test"); code != 1 {
+					t.Fatalf("mirror failure exit=%d", code)
+				}
+				local, err := state.Load(filepath.Join(f.local, "state.jsonl"))
+				if err != nil || local.Len() != 1 {
+					t.Fatalf("missing local state: %v", err)
+				}
+				row := local.All()[0]
+				dest := row.HDPath
+				if route == "import" {
+					dest = row.LaptopPath
+				}
+				before, err := os.Stat(dest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch selection {
+				case "no-camera":
+					detectCameras = func([]config.CameraProfile) ([]camera.DetectedCamera, error) { return nil, nil }
+				case "empty-card":
+					if err := os.Remove(src); err != nil {
+						t.Fatal(err)
+					}
+				case "excluded":
+					f.cfg.TransferExtensions = []string{}
+				}
+				if code := Run([]string{route}, "test"); code != 1 {
+					t.Fatalf("skipped copy ignored ongoing mirror failure: %d", code)
+				}
+				fault.Hook = nil
+				if code := Run([]string{route}, "test"); code != 0 {
+					t.Fatalf("mirror retry exit=%d", code)
+				}
+				mirrored, err := state.Load(hdState(f.cfg))
+				if err != nil || mirrored.Len() != 1 {
+					t.Fatalf("missing mirrored state: %v", err)
+				}
+				got := mirrored.All()[0]
+				if got.SHA256 != row.SHA256 || got.LaptopPath != row.LaptopPath || got.HDPath != row.HDPath || got.HDVolumeUUID != row.HDVolumeUUID {
+					t.Fatal("repaired mirror differs from committed transfer")
+				}
+				after, err := os.Stat(dest)
+				if err != nil || !os.SameFile(before, after) {
+					t.Fatal("retry recopied verified media")
+				}
+				requireBytes(t, dest, "original")
+			})
+		}
+	}
+}
+
+func TestImportWithDisconnectedOptionalMirror(t *testing.T) {
+	f := commands(t)
+	f.write(t, filepath.Join(f.card, "clip.MP4"), "original")
+	if err := os.Rename(f.hd, f.hd+"-offline"); err != nil {
+		t.Fatal(err)
+	}
+	fault.Hook = func(step string) error {
+		if step == "mirror-save" {
+			t.Fatal("attempted a mirror write to a disconnected drive")
+		}
+		return nil
+	}
+	defer func() { fault.Hook = nil }()
+	// Both a new import and an already-imported retry work without the drive.
+	for i := 0; i < 2; i++ {
+		if code := Run([]string{"import"}, "test"); code != 0 {
+			t.Fatalf("disconnected optional mirror exit=%d", code)
+		}
+	}
+	local, err := state.Load(filepath.Join(f.local, "state.jsonl"))
+	if err != nil || local.Len() != 1 {
+		t.Fatalf("missing imported state: %v", err)
+	}
+	requireBytes(t, local.All()[0].LaptopPath, "original")
+	if _, err := os.Stat(f.hd); !os.IsNotExist(err) {
+		t.Fatalf("import recreated the disconnected volume path: %v", err)
+	}
+}
