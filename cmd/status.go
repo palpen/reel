@@ -2,17 +2,17 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/pspenano/reel/internal/camera"
-	"github.com/pspenano/reel/internal/config"
 	"github.com/pspenano/reel/internal/display"
 	"github.com/pspenano/reel/internal/lockfile"
 	"github.com/pspenano/reel/internal/state"
+	"github.com/pspenano/reel/internal/transfer"
 )
 
 // RunStatus implements `reel status`.
@@ -22,13 +22,16 @@ func RunStatus(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unsupported arguments: %v", fs.Args())
+	}
 
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	cfgDir, err := config.Dir()
+	cfgDir, err := configDir()
 	if err != nil {
 		return err
 	}
@@ -43,7 +46,7 @@ func RunStatus(args []string) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	cameras, err := camera.Detect(cfg.Cameras)
+	cameras, err := detectCameras(cfg.Cameras)
 	if err != nil {
 		return fmt.Errorf("detect cameras: %w", err)
 	}
@@ -61,19 +64,21 @@ func RunStatus(args []string) error {
 		TotalGB string `json:"total_gb"`
 	}
 	type hdStatus struct {
-		Connected         bool      `json:"connected"`
-		ManagedSizeGB     string    `json:"managed_size_gb,omitempty"`
-		StaleVerifyCount  int       `json:"stale_verify_count"`
-		LastVerifiedAt    time.Time `json:"last_verified_at,omitempty"`
+		Copies           map[string]int `json:"copies"`
+		Connected        bool           `json:"connected"`
+		ManagedSizeGB    string         `json:"managed_size_gb,omitempty"`
+		StaleVerifyCount int            `json:"stale_verify_count"`
+		LastVerifiedAt   time.Time      `json:"last_verified_at,omitempty"`
 	}
 	type statusOut struct {
-		Camera         cameraStatus `json:"camera"`
-		Laptop         laptopStatus `json:"laptop"`
-		HD             hdStatus     `json:"hd"`
-		LastImportAt   *time.Time   `json:"last_import_at"`
-		LastBackupAt   *time.Time   `json:"last_backup_at"`
-		LastCleanAt    *time.Time   `json:"last_clean_at"`
-		TotalTracked   int          `json:"total_tracked"`
+		Camera           cameraStatus `json:"camera"`
+		Laptop           laptopStatus `json:"laptop"`
+		HD               hdStatus     `json:"hd"`
+		LastImportAt     *time.Time   `json:"last_import_at"`
+		LastBackupAt     *time.Time   `json:"last_backup_at"`
+		LastCleanAt      *time.Time   `json:"last_clean_at"`
+		TotalTracked     int          `json:"total_tracked"`
+		RetainedPartials []string     `json:"retained_partials"`
 	}
 
 	out := statusOut{TotalTracked: st.Len()}
@@ -128,15 +133,16 @@ func RunStatus(args []string) error {
 
 	// HD
 	{
-		hdRoot := cfg.HDRoot()
-		_, hdErr := os.Stat(hdRoot)
+		_, hdErr := approvedHD(cfg)
 		hdConnected := hdErr == nil
+		copies := map[string]int{}
 		var managedSize int64
 		var staleCount int
 		var lastVerified time.Time
 		staleThreshold := 7 * 24 * time.Hour
 		now := time.Now()
 		for _, r := range st.All() {
+			copies[copyStatus(r)]++
 			if r.HDPath != "" {
 				if info, err := os.Stat(r.HDPath); err == nil {
 					managedSize += info.Size()
@@ -152,6 +158,7 @@ func RunStatus(args []string) error {
 			}
 		}
 		out.HD = hdStatus{
+			Copies:           copies,
 			Connected:        hdConnected,
 			ManagedSizeGB:    display.Bytes(managedSize),
 			StaleVerifyCount: staleCount,
@@ -159,6 +166,12 @@ func RunStatus(args []string) error {
 		}
 	}
 
+	for _, root := range []string{cfg.LaptopDir, hdManaged(cfg)} {
+		paths, err := transfer.SweepOrphanTmps(root)
+		if err == nil {
+			out.RetainedPartials = append(out.RetainedPartials, paths...)
+		}
+	}
 	// Last import/backup/clean
 	for _, r := range st.All() {
 		if r.ImportedAt != nil && (out.LastImportAt == nil || r.ImportedAt.After(*out.LastImportAt)) {
@@ -204,6 +217,10 @@ func RunStatus(args []string) error {
 		fmt.Println("not connected")
 	}
 
+	for _, path := range out.RetainedPartials {
+		fmt.Printf("Retained partial (never automatically removed): %s\n", path)
+	}
+	fmt.Printf("HD copies: %v\n", out.HD.Copies)
 	fmt.Printf("\nTracked files: %d\n", out.TotalTracked)
 	if out.LastImportAt != nil {
 		fmt.Printf("Last import:   %s\n", out.LastImportAt.Local().Format(time.RFC3339))
@@ -216,4 +233,27 @@ func RunStatus(args []string) error {
 	}
 
 	return nil
+}
+
+func copyStatus(r *state.Row) string {
+	if r.HDPath == "" {
+		return "absent"
+	}
+	h, n, err := transfer.HashFile(r.HDPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "absent"
+	}
+	if err != nil {
+		return "conflicting"
+	}
+	if r.SHA256 == "" || r.HDVolumeUUID == "" || r.HDVerifiedAt == nil {
+		return "unverified"
+	}
+	if h != r.SHA256 || n != r.SizeBytes {
+		return "conflicting"
+	}
+	if time.Since(*r.HDVerifiedAt) > defaultStaleThreshold {
+		return "stale"
+	}
+	return "verified"
 }

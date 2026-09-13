@@ -4,8 +4,9 @@ package lockfile
 import (
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
+
+	"github.com/pspenano/reel/internal/safefs"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -28,7 +29,15 @@ func AcquireShared(path string) (*Lock, error) {
 }
 
 func acquire(path string, how int, timeout time.Duration) (*Lock, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	d, err := safefs.OpenDir(filepath.Dir(path), false)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	if err := safefs.SupportedFS(d); err != nil {
+		return nil, err
+	}
+	f, err := safefs.OpenAt(d, filepath.Base(path), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("lockfile open %s: %w", path, err)
 	}
@@ -44,46 +53,25 @@ func acquire(path string, how int, timeout time.Duration) (*Lock, error) {
 			return nil, fmt.Errorf("flock %s: %w", path, err)
 		}
 		if time.Now().After(deadline) {
-			// Read PID from file
-			pid := readPID(f)
 			f.Close()
-			if pid > 0 {
-				return nil, fmt.Errorf("another reel process is running (pid %d)", pid)
-			}
 			return nil, fmt.Errorf("another reel process is running")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Write our PID
-	if how == syscall.LOCK_EX {
-		if err := f.Truncate(0); err == nil {
-			f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
-		}
-	}
-
 	return &Lock{path: path, f: f}, nil
 }
 
-func readPID(f *os.File) int {
-	buf := make([]byte, 32)
-	n, _ := f.ReadAt(buf, 0)
-	if n == 0 {
-		return 0
-	}
-	s := strings.TrimSpace(string(buf[:n]))
-	pid, _ := strconv.Atoi(s)
-	return pid
-}
-
-// Release releases the lock and removes the lockfile.
+// Release releases the descriptor; the lockfile is permanent.
 func (l *Lock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
-	syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
-	l.f.Close()
-	os.Remove(l.path)
+	err := syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+	closeErr := l.f.Close()
 	l.f = nil
-	return nil
+	if err != nil {
+		return err
+	}
+	return closeErr
 }

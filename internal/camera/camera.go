@@ -69,6 +69,9 @@ func (dc *DetectedCamera) Walk() ([]File, error) {
 			return err
 		}
 		if d.IsDir() {
+			if d.Name() == ".reel-trash" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		name := d.Name()

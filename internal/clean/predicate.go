@@ -48,7 +48,7 @@ func ShouldDelete(s FileState) Decision {
 		return Decision{false, "HD file size mismatch"}
 	}
 	// D5: hash must match state
-	if s.HDFileSHA256 != s.StateSHA256 {
+	if s.StateSHA256 == "" || s.HDFileSHA256 != s.StateSHA256 {
 		return Decision{false, "HD file hash mismatch"}
 	}
 	// D6: verification must not be stale (unless --force-stale)

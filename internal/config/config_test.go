@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -289,5 +290,24 @@ func TestToConfigPreservesNonFirstCameraProfiles(t *testing.T) {
 	}
 	if cfg.Cameras[1].Name != "Custom Cam" {
 		t.Errorf("second camera was modified: %+v", cfg.Cameras[1])
+	}
+}
+
+func TestRecoverableOnlyJSON(t *testing.T) {
+	for _, s := range []string{`{}`, `{"soft_delete":true}`} {
+		var c Config
+		if err := json.Unmarshal([]byte(s), &c); err != nil || !c.SoftDelete {
+			t.Fatalf("recoverable default: %s %v", s, err)
+		}
+		b, _ := json.Marshal(c)
+		if strings.Contains(string(b), "soft_delete") {
+			t.Fatal("obsolete setting serialized")
+		}
+	}
+	for _, s := range []string{`{"soft_delete":false}`, `{"soft_delete":null}`, `{"soft_delete":"true"}`, `null`} {
+		var c Config
+		if err := json.Unmarshal([]byte(s), &c); err == nil {
+			t.Fatalf("unsafe config accepted: %s", s)
+		}
 	}
 }

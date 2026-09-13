@@ -3,7 +3,10 @@ package transfer_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"github.com/pspenano/reel/internal/fault"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,8 +29,8 @@ func sha256hex(data []byte) string {
 }
 
 func TestCopyBasic(t *testing.T) {
-	src := t.TempDir()
-	dst := t.TempDir()
+	src := realTempDir(t)
+	dst := realTempDir(t)
 
 	content := make([]byte, 2048)
 	for i := range content {
@@ -67,8 +70,8 @@ func TestCopyBasic(t *testing.T) {
 }
 
 func TestCopyHashVerification_Match(t *testing.T) {
-	src := t.TempDir()
-	dst := t.TempDir()
+	src := realTempDir(t)
+	dst := realTempDir(t)
 
 	content := []byte("hello reel")
 	srcPath := writeTestFile(t, src, "test.MP4", content)
@@ -84,8 +87,8 @@ func TestCopyHashVerification_Match(t *testing.T) {
 }
 
 func TestCopyHashVerification_Mismatch(t *testing.T) {
-	src := t.TempDir()
-	dst := t.TempDir()
+	src := realTempDir(t)
+	dst := realTempDir(t)
 
 	content := []byte("hello reel")
 	srcPath := writeTestFile(t, src, "test.MP4", content)
@@ -110,8 +113,8 @@ func TestCopyHashVerification_Mismatch(t *testing.T) {
 }
 
 func TestCopyPartialFailureCleanup(t *testing.T) {
-	src := t.TempDir()
-	dst := t.TempDir()
+	src := realTempDir(t)
+	dst := realTempDir(t)
 
 	// Try to copy a nonexistent file
 	srcPath := filepath.Join(src, "nonexistent.MP4")
@@ -128,8 +131,8 @@ func TestCopyPartialFailureCleanup(t *testing.T) {
 }
 
 func TestCopyMtimeSet(t *testing.T) {
-	src := t.TempDir()
-	dst := t.TempDir()
+	src := realTempDir(t)
+	dst := realTempDir(t)
 
 	content := []byte("mtime test")
 	srcPath := writeTestFile(t, src, "mtime.MP4", content)
@@ -155,7 +158,7 @@ func TestCopyMtimeSet(t *testing.T) {
 }
 
 func TestHashFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	content := []byte("hash me please")
 	path := writeTestFile(t, dir, "data.bin", content)
 
@@ -180,8 +183,8 @@ func TestHashFile_NonExistent(t *testing.T) {
 }
 
 func TestCopyDestDirCreated(t *testing.T) {
-	src := t.TempDir()
-	dst := filepath.Join(t.TempDir(), "nested", "dir")
+	src := realTempDir(t)
+	dst := filepath.Join(realTempDir(t), "nested", "dir")
 
 	content := []byte("mkdir test")
 	srcPath := writeTestFile(t, src, "nested.MP4", content)
@@ -197,7 +200,7 @@ func TestCopyDestDirCreated(t *testing.T) {
 
 func TestFreeBytes(t *testing.T) {
 	t.Run("valid dir returns positive", func(t *testing.T) {
-		dir := t.TempDir()
+		dir := realTempDir(t)
 		n, err := transfer.FreeBytes(dir)
 		if err != nil {
 			t.Fatalf("FreeBytes: %v", err)
@@ -215,7 +218,7 @@ func TestFreeBytes(t *testing.T) {
 }
 
 func TestPreflightSpace(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 
 	t.Run("enough space returns nil", func(t *testing.T) {
 		if err := transfer.PreflightSpace(dir, 1); err != nil {
@@ -252,8 +255,8 @@ func TestSweepOrphanTmps(t *testing.T) {
 		}
 	})
 
-	t.Run("removes nested .tmp files, leaves real files", func(t *testing.T) {
-		root := t.TempDir()
+	t.Run("reports nested .tmp files and preserves every file", func(t *testing.T) {
+		root := realTempDir(t)
 		// Create nested dirs with mixed .tmp and non-.tmp files
 		subA := filepath.Join(root, "2026-05-27_100000")
 		subB := filepath.Join(root, "2026-05-26_180000")
@@ -287,8 +290,8 @@ func TestSweepOrphanTmps(t *testing.T) {
 		}
 
 		for _, p := range tmpFiles {
-			if _, err := os.Stat(p); !os.IsNotExist(err) {
-				t.Errorf("tmp file still exists: %s", p)
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("partial was lost: %s", p)
 			}
 		}
 		for _, p := range realFiles {
@@ -306,4 +309,191 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	p, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestFailuresRetainSourceAndPartials(t *testing.T) {
+	for _, step := range []string{"stage-create", "transfer-intent", "mid-copy", "stage-sync", "stage-close", "publication"} {
+		t.Run(step, func(t *testing.T) {
+			srcDir, dst := realTempDir(t), realTempDir(t)
+			src := writeTestFile(t, srcDir, "clip.MP4", []byte("irreplaceable"))
+			fault.Hook = func(name string) error {
+				if name == step {
+					return fmt.Errorf("injected %s", step)
+				}
+				return nil
+			}
+			defer func() { fault.Hook = nil }()
+			if _, err := transfer.Copy(src, dst, "clip.MP4", time.Time{}, ""); err == nil {
+				t.Fatal("injection missed")
+			}
+			data, _ := os.ReadFile(src)
+			if string(data) != "irreplaceable" {
+				t.Fatal("source changed")
+			}
+			if step == "mid-copy" || step == "stage-sync" || step == "stage-close" || step == "publication" {
+				paths, _ := filepath.Glob(filepath.Join(dst, ".reel-stage-*"))
+				if len(paths) != 1 {
+					t.Fatal("partial missing")
+				}
+				data, _ := os.ReadFile(paths[0])
+				if string(data) != "irreplaceable" {
+					t.Fatal("useful staged bytes lost")
+				}
+			}
+		})
+	}
+}
+func TestAliasAndCollisionPreservation(t *testing.T) {
+	for _, kind := range []string{"collision", "temp-symlink", "parent-symlink", "hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			root := realTempDir(t)
+			src := writeTestFile(t, root, "source.MP4", []byte("original"))
+			destDir := filepath.Join(root, "dest")
+			os.Mkdir(destDir, 0700)
+			dest := filepath.Join(destDir, "clip.MP4")
+			switch kind {
+			case "collision":
+				os.WriteFile(dest, []byte("archive"), 0600)
+			case "temp-symlink":
+				os.Symlink(src, dest+".tmp")
+			case "parent-symlink":
+				os.Remove(destDir)
+				os.Symlink(root, destDir)
+			case "hardlink":
+				os.Link(src, dest)
+			}
+			_, err := transfer.Copy(src, destDir, "clip.MP4", time.Time{}, "")
+			if kind != "temp-symlink" && err == nil {
+				t.Fatal("unsafe destination accepted")
+			}
+			data, _ := os.ReadFile(src)
+			if string(data) != "original" {
+				t.Fatal("source bytes changed")
+			}
+			if kind == "collision" {
+				data, _ = os.ReadFile(dest)
+				if string(data) != "archive" {
+					t.Fatal("archive overwritten")
+				}
+			}
+		})
+	}
+}
+
+func TestCrashRetainsIntentAndStage(t *testing.T) {
+	if src := os.Getenv("REEL_TEST_CRASH_SOURCE"); src != "" {
+		fault.Hook = func(name string) error {
+			if name == "publication" {
+				os.Exit(29)
+			}
+			return nil
+		}
+		transfer.Copy(src, os.Getenv("REEL_TEST_CRASH_DEST"), "clip.MP4", time.Time{}, "")
+		os.Exit(30)
+	}
+	root := realTempDir(t)
+	src := writeTestFile(t, root, "source.MP4", []byte("survives crash"))
+	dest := filepath.Join(root, "dest")
+	child := exec.Command(os.Args[0], "-test.run=^TestCrashRetainsIntentAndStage$")
+	child.Env = append(os.Environ(), "REEL_TEST_CRASH_SOURCE="+src, "REEL_TEST_CRASH_DEST="+dest)
+	if err := child.Run(); err == nil {
+		t.Fatal("child did not stop at publication")
+	}
+	stages, _ := filepath.Glob(filepath.Join(dest, ".reel-stage-*"))
+	records, _ := filepath.Glob(filepath.Join(dest, ".reel-transfer-*"))
+	if len(stages) != 1 || len(records) != 1 {
+		t.Fatal("crash recovery material missing")
+	}
+	data, _ := os.ReadFile(stages[0])
+	if string(data) != "survives crash" {
+		t.Fatal("stage lost")
+	}
+	if _, err := transfer.Copy(src, dest, "clip.MP4", time.Time{}, ""); err != nil {
+		t.Fatal("retry failed", err)
+	}
+	data, _ = os.ReadFile(stages[0])
+	if string(data) != "survives crash" {
+		t.Fatal("retry reclaimed interrupted media")
+	}
+}
+
+func TestCompetingProcessCopiesNeverReplaceWinner(t *testing.T) {
+	if src := os.Getenv("REEL_TEST_RACE_SOURCE"); src != "" {
+		_, err := transfer.Copy(src, os.Getenv("REEL_TEST_RACE_DEST"), "clip.MP4", time.Time{}, "")
+		if err != nil {
+			os.Exit(31)
+		}
+		os.Exit(0)
+	}
+	root := realTempDir(t)
+	a := writeTestFile(t, root, "a.MP4", []byte("first recording"))
+	b := writeTestFile(t, root, "b.MP4", []byte("second recording"))
+	dest := filepath.Join(root, "dest")
+	makeChild := func(src string) *exec.Cmd {
+		c := exec.Command(os.Args[0], "-test.run=^TestCompetingProcessCopiesNeverReplaceWinner$")
+		c.Env = append(os.Environ(), "REEL_TEST_RACE_SOURCE="+src, "REEL_TEST_RACE_DEST="+dest)
+		return c
+	}
+	x, y := makeChild(a), makeChild(b)
+	if err := x.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := y.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ex, ey := x.Wait(), y.Wait()
+	if (ex == nil) == (ey == nil) {
+		t.Fatalf("expected exactly one winner: %v %v", ex, ey)
+	}
+	data, err := os.ReadFile(filepath.Join(dest, "clip.MP4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex == nil && string(data) != "first recording" || ey == nil && string(data) != "second recording" {
+		t.Fatal("successful copy was overwritten")
+	}
+}
+
+func TestNestedDestinationSyncFailurePreservesSource(t *testing.T) {
+	root := realTempDir(t)
+	src := writeTestFile(t, root, "source.MP4", []byte("original"))
+	parent := filepath.Join(root, "new-session")
+	dest := filepath.Join(parent, "footage")
+	injected := false
+	fault.Hook = func(step string) error {
+		if step == "directory-sync" {
+			if _, err := os.Stat(parent); err == nil {
+				injected = true
+				return fmt.Errorf("parent sync failed")
+			}
+		}
+		return nil
+	}
+	defer func() { fault.Hook = nil }()
+	if _, err := transfer.Copy(src, dest, "clip.MP4", time.Time{}, ""); err == nil {
+		t.Fatal("unsynced parent accepted")
+	}
+	if !injected {
+		t.Fatal("did not reach new parent barrier")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatal("descended before parent was synced")
+	}
+	data, err := os.ReadFile(src)
+	if err != nil || string(data) != "original" {
+		t.Fatal("source changed")
+	}
+	fault.Hook = nil
+	if _, err := transfer.Copy(src, dest, "clip.MP4", time.Time{}, ""); err != nil {
+		t.Fatal("retry failed", err)
+	}
 }
