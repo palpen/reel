@@ -1,30 +1,27 @@
 # reel
 
-Camera transfer CLI for macOS. Moves footage from card to laptop to external HD, verifies every copy with SHA-256, and won't touch the card until you've confirmed a hash-verified backup exists.
+Camera transfer CLI for macOS. Copies footage from card to laptop to external HD,
+verifies copies with SHA-256, and moves backed-up camera files into journaled
+recovery after confirmation. Recovery retains the media on the card and does not
+free card space.
 
+**Current filesystem limitation:** importing from exFAT into APFS works. Cleaning
+an exFAT camera card or publishing to an exFAT archive is currently unavailable;
+these operations refuse safely. See [filesystem support and validation](#filesystems-and-release-validation).
+
+On supported filesystems, the usual workflow is:
+
+```bash
+reel config          # First-time setup; bind the mounted backup drive
+reel import          # Camera → laptop; MP4 only by default
+reel backup          # Laptop → backup drive
+reel verify          # Recheck archived files
+reel clean --dry-run # Preview eligible recovery moves
+reel clean           # Confirm moves into the camera's .reel-trash directory
 ```
-$ reel status
-Camera: connected (47 files, 142.3 GB)
-Laptop: /Users/.../Videos/Footage — 0 new, 312 archived
-HD:     connected, 312 backed up, 0 stale verifications
-Last import: 2026-05-09  14:22
 
-$ reel import
-[01/47] DJI_20260516141822_0001_D.MP4  3.1GB  ████████  100%
-...
-✓ 47 copied, 0 skipped, 142.3 GB in 4m12s
-
-$ reel backup
-✓ 47 backed up, all hashes match
-
-$ reel clean
-Files eligible for recoverable movement (94):
-  DJI_20260516141822_0001_D.LRF (preview; matching MP4 backup verified)
-  DJI_20260516141822_0001_D.MP4
-...
-Files will move to /Volumes/SD_Card/.reel-trash, with original paths saved for recovery.
-Move 94 files to recovery? [y/N]: y
-```
+Use `reel direct_backup` instead of `import` and `backup` to copy straight from the
+camera to the backup drive. Connect exactly one camera for camera operations.
 
 MP4-only transfers work with camera cleaning: a verified MP4 allows its matching
 LRF preview to be cleared too. Unbacked WAV audio stays on the card.
@@ -41,16 +38,28 @@ LRF preview to be cleared too. Unbacked WAV audio stays on the card.
 | `reel restore --journal PATH` | Restore a camera recovery entry without overwriting |
 | `reel status` | Show state of everything |
 | `reel history` | Show recent activity timeline (imports, backups, verifies, cleans) |
-| `reel config` | Re-run the setup wizard with current values pre-filled |
+| `reel config` | Create or edit configuration and bind the mounted backup drive |
 
-`clean` supports `--dry-run`. `status` supports `--json`.
+| Command | Flags |
+|---|---|
+| `clean` | `--dry-run`; `--force-stale` bypasses only the seven-day verification age check |
+| `verify` | `--bind-legacy` binds verified backup records to the selected drive; `--scope hd` is the only supported scope |
+| `restore` | `--journal /absolute/path/to/recovery.json` is required |
+| `status` | `--json` |
+| `history` | `--json`; `--limit N` (default 20; zero shows all); `--type TYPE` accepts `import`, `backup`, `verify`, or `clean` |
+
+`reel status` reports HD copies as absent, unverified, conflicting, stale, or
+verified, and lists retained staging and transfer records. It hashes tracked HD
+files, so checking a large archive can take time. `history` reports timestamps
+from current state rather than a complete log of every command invocation.
 
 ## Safety
 
 Transfers (`import`, `backup`, and `direct_backup`) default to MP4 only, including
 files tracked by older versions. Set the top-level `"transfer_extensions": ["MP4"]`
 in `~/.config/reel/config.json` to make this explicit. Add `"WAV"` if you want separate
-audio too. An empty list disables all transfers. Matching is case-insensitive.
+audio too, or `"LRF"` to include previews. An empty list disables all transfers.
+Matching is case-insensitive.
 The camera profile's regex still recognizes companion files; its `extensions`
 field does not control transfers.
 
@@ -107,6 +116,8 @@ Quarantined files have no automatic expiry and still occupy disk space. Nothing 
 this tool permanently deletes footage. It does not scan disconnected drives, cloud
 backups, or Time Machine snapshots.
 
+### Camera cleaning and restoration
+
 `reel clean` checks each original MP4/WAV before removing it from the camera folder:
 
 1. File has an HD path recorded in state
@@ -132,6 +143,9 @@ directory without requiring a configuration file or connected backup drive.
 For an LRF first tracked during cleaning, restore records its verified journal hash
 so it can later be imported or backed up when LRF transfers are enabled. If an older
 build already restored that LRF, rerun the same restore command to repair its state.
+The same journal can also be retried after media restoration succeeds but saving
+local state fails. Reel checks the already-restored bytes against the journal
+before repairing the state.
 
 Reel never falls back to permanent deletion. Mutations require supported filesystem capabilities; see the validation limits below.
 Recovered files still occupy card space until the recovery folder is removed or
@@ -146,8 +160,15 @@ create recovery records, run setup, or mirror state. Unsupported positional argu
 are errors, including `reel clean camera-name --dry-run`. Connect exactly one camera
 for camera mutations.
 
+### Transfers and retries
+
 Transfers never replace existing archives. An identical destination can be reused
 after current source and destination verification; differing content stops the batch.
+Before the copy engine returns success, it rechecks that the destination still
+names the verified file and that its containing directory has not been replaced.
+This also applies when reusing an existing identical copy or accepting a matching
+copy published by another writer; an unchanged volume UUID alone is insufficient.
+
 A backup skip requires the recorded path to be inside the selected archive and
 its volume UUID to match. A copy on another drive causes an explicit conflict; the
 existing single-backup history is preserved. Unbound legacy records require
@@ -156,8 +177,13 @@ from a verified source; changed canonical originals and ambiguous filenames requ
 Removing a completed laptop copy does not block later backups: Reel checks that
 the recorded archive still matches its canonical hash, size, and selected volume.
 An unavailable or conflicting archive still stops the batch.
+
 Interrupted `.reel-stage-*` media and `.reel-transfer-*` intents remain in place.
 Legacy `.tmp` files are never swept. No automatic recovery cleanup occurs.
+After fixing an operational failure, rerun the transfer command: completed copies
+are checked and remaining files are retried. Retained partials are not automatically
+resumed or removed. If media was published before a state write failed, the retry
+can reuse the matching destination and record the completed copy.
 
 Exit codes: `0` means completed work or a legitimate empty selection; `1` means an
 operational failure, partial failure, or cancellation; `2` means invalid arguments or
@@ -205,14 +231,26 @@ archive works. `.reel-capability-*` directories contain
 owned empty probe files. Keep lockfiles in place; unlinking them breaks coordination.
 Network filesystems are unsupported.
 
-The fixture suites cover collisions, aliases, interrupted copying, lock handoff,
-state failures, quarantine attacks, and both clean/restore workflows. They do not
-prove removable-drive durability or physical power-loss behavior. The Go 1.22/current
-and Python 3.9/current CI matrix has passed. Disposable-image tests confirm APFS
-workflows and safe rejection on exFAT; exFAT write support and the remaining
+The fixture suites cover collisions, aliases, directory/file replacement during
+copy verification, interrupted copying, lock handoff, state failures and retries,
+backups after laptop-copy removal, quarantine attacks, and clean/restore workflows
+including restoration on a fresh installation. They do not prove removable-drive
+durability or physical power-loss behavior. The Go 1.22/current × Python 3.9/3.14
+matrix passed for the latest code fixes (`a4d9faf`):
+[PR CI run](https://github.com/palpen/reel/actions/runs/34788637936).
+Disposable-image tests confirm APFS workflows and safe rejection on exFAT;
+exFAT write support and the remaining
 physical-drive validation are still release limitations. Run
 `python3 scripts/validate_disk_images.py` on macOS with DiskManagement access to
 repeat those checks. See [the release validation record](docs/REMEDIATION_VALIDATION.md).
+
+Run the local checks with:
+
+```bash
+make test           # Go race tests and Python tests
+go vet ./...
+make build
+```
 
 ## Camera profiles
 
@@ -241,6 +279,16 @@ Camera and HD subdirectories must be relative and cannot contain `..`. Symlinks,
 Everything reel knows lives in `~/.config/reel/state.jsonl` — one JSON object per line, one per `(camera_profile, base_name, extension)`. Human-readable, Time Machine-backed, not iCloud-synced.
 
 After transfer, verification, or cleaning, compatible rows are merged to `<hd_root>/.reel-state.jsonl` under a persistent lock as a disaster-recovery mirror. If the laptop dies, the HD carries both the footage and the state.
+
+Writers use persistent locks for local state, archives, and camera operations. The
+Python quarantine tool shares the archive lock with Go, including for subtree
+selections. Keep lockfiles and `.reel-protocol.json` markers in place. Unknown state
+fields are preserved, while malformed records, duplicate keys, and conflicting
+canonical identities stop writes.
+
+The current supported use case is one camera and one desktop. Independently
+configured desktops sharing an archive can still lose client-local history when
+merging records for the same recording; that limitation remains unresolved.
 
 ## Uninstall
 
