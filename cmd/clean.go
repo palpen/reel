@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bufio"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -10,14 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pspenano/reel/internal/camera"
-	"github.com/pspenano/reel/internal/clean"
-	"github.com/pspenano/reel/internal/config"
 	"github.com/pspenano/reel/internal/display"
 	"github.com/pspenano/reel/internal/lockfile"
 	"github.com/pspenano/reel/internal/state"
-	"github.com/pspenano/reel/internal/transfer"
 	"github.com/pspenano/reel/internal/trash"
+	"github.com/pspenano/reel/internal/volume"
 )
 
 const defaultStaleThreshold = 7 * 24 * time.Hour
@@ -25,18 +21,25 @@ const defaultStaleThreshold = 7 * 24 * time.Hour
 // RunClean implements `reel clean`.
 func RunClean(args []string) error {
 	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
-	dryRun := fs.Bool("dry-run", false, "show what would be deleted without deleting")
+	dryRun := fs.Bool("dry-run", false, "preview recoverable moves without changing media or state")
 	forceStale := fs.Bool("force-stale", false, "ignore stale verification threshold")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unsupported arguments: %v", fs.Args())
+	}
 
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	cfgDir, err := config.Dir()
+	hdIdentity, err := approvedHD(cfg)
+	if err != nil {
+		return err
+	}
+	cfgDir, err := configDir()
 	if err != nil {
 		return err
 	}
@@ -46,12 +49,20 @@ func RunClean(args []string) error {
 	}
 	defer lk.Release()
 
+	if !*dryRun {
+		archive, err := archiveLock(cfg)
+		if err != nil {
+			return err
+		}
+		defer archive.Release()
+	}
+
 	st, err := state.Load(filepath.Join(cfgDir, "state.jsonl"))
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	cameras, err := camera.Detect(cfg.Cameras)
+	cameras, err := detectCameras(cfg.Cameras)
 	if err != nil {
 		return fmt.Errorf("detect cameras: %w", err)
 	}
@@ -60,127 +71,53 @@ func RunClean(args []string) error {
 		return nil
 	}
 
+	if len(cameras) != 1 {
+		return fmt.Errorf("multiple cameras detected; connect exactly one camera")
+	}
 	dc := &cameras[0]
+	if !*dryRun {
+		cardLock, err := lockfile.AcquireExclusive(filepath.Join(dc.VolumePath, "reel.lock"))
+		if err != nil {
+			return err
+		}
+		defer cardLock.Release()
+	}
 	files, err := dc.Walk()
 	if err != nil {
 		return fmt.Errorf("walk DCIM: %w", err)
 	}
 
-	now := time.Now().UTC()
-
-	// Build per-base_name decision map
-	// key = profile+base_name, value = list of (ext, file, decision)
-	type candidate struct {
-		file     camera.File
-		row      *state.Row
-		decision clean.Decision
+	if err := validateCameraBatch(files); err != nil {
+		return err
 	}
-	type baseGroup struct {
-		candidates []candidate
+	cameraIdentity, err := resolveVolume(dc.VolumePath)
+	if err != nil {
+		return err
 	}
-	groups := make(map[string]*baseGroup)
+	if err = volume.Independent(cameraIdentity, hdIdentity); err != nil {
+		return err
+	}
+	toDelete, heldBack := planClean(files, st, time.Now().UTC(), *forceStale)
 
-	for _, f := range files {
-		f := f // capture
-		row := st.GetByParts(f.Profile.Name, f.BaseName, f.Ext)
-		if row == nil {
-			// Not tracked — can't delete
-			key := f.Profile.Name + "\x00" + f.BaseName
-			if groups[key] == nil {
-				groups[key] = &baseGroup{}
-			}
-			groups[key].candidates = append(groups[key].candidates, candidate{
-				file: f,
-				row:  nil,
-				decision: clean.Decision{
-					Delete: false,
-					Reason: "not tracked in state",
-				},
-			})
-			continue
-		}
-
-		// Re-stat and re-hash HD copy
-		var hdExists bool
-		var hdSize int64
-		var hdHash string
-		var hdVerifiedAt time.Time
-
-		if row.HDPath != "" {
-			if info, err := os.Stat(row.HDPath); err == nil {
-				hdExists = true
-				hdSize = info.Size()
-			}
-			if hdExists {
-				h, _, err := transfer.HashFile(row.HDPath)
-				if err == nil {
-					hdHash = h
+	for i := range toDelete {
+		d := &toDelete[i]
+		for _, snapshot := range d.snapshots {
+			if snapshot.path == d.row.HDPath {
+				if err := volume.Contains(hdManaged(cfg), snapshot.path); err != nil {
+					return err
 				}
 			}
 		}
-		if row.HDVerifiedAt != nil {
-			hdVerifiedAt = *row.HDVerifiedAt
+		if d.file.Ext != "LRF" && d.row.HDVolumeUUID != hdIdentity.UUID {
+			return fmt.Errorf("legacy backup identity needs explicit verification: reel verify --bind-legacy")
 		}
-
-		fs := clean.FileState{
-			CameraProfile:  row.CameraProfile,
-			BaseName:       row.BaseName,
-			Ext:            row.Ext,
-			CameraPath:     row.CameraPath,
-			HDPath:         row.HDPath,
-			HDFileExists:   hdExists,
-			HDFileSize:     hdSize,
-			StateSize:      row.SizeBytes,
-			HDFileSHA256:   hdHash,
-			StateSHA256:    row.SHA256,
-			HDVerifiedAt:   hdVerifiedAt,
-			Now:            now,
-			StaleThreshold: defaultStaleThreshold,
-			ForceStale:     *forceStale,
-		}
-		dec := clean.ShouldDelete(fs)
-
-		key := f.Profile.Name + "\x00" + f.BaseName
-		if groups[key] == nil {
-			groups[key] = &baseGroup{}
-		}
-		groups[key].candidates = append(groups[key].candidates, candidate{
-			file:     f,
-			row:      row,
-			decision: dec,
-		})
-	}
-
-	// B1: all siblings must pass before any are deleted
-	type deleteItem struct {
-		file camera.File
-		row  *state.Row
-	}
-	var toDelete []deleteItem
-	var heldBack []candidate
-
-	for _, grp := range groups {
-		// Check if all candidates pass
-		allPass := true
-		for _, c := range grp.candidates {
-			if !c.decision.Delete {
-				allPass = false
-				break
+		d.validate = func() error {
+			if err := checkVolume(cameraIdentity); err != nil {
+				return err
 			}
-		}
-		if allPass {
-			for _, c := range grp.candidates {
-				toDelete = append(toDelete, deleteItem{c.file, c.row})
-			}
-		} else {
-			for _, c := range grp.candidates {
-				if !c.decision.Delete {
-					heldBack = append(heldBack, c)
-				}
-			}
+			return checkVolume(hdIdentity)
 		}
 	}
-
 	// Print held-back list
 	if len(heldBack) > 0 {
 		display.Print("\nHeld back (%d files):", len(heldBack))
@@ -190,29 +127,17 @@ func RunClean(args []string) error {
 	}
 
 	if len(toDelete) == 0 {
-		display.Print("\nNothing to delete.")
+		display.Print("\nNothing eligible for recovery.")
 		return nil
 	}
 
-	display.Print("\nFiles eligible for deletion (%d):", len(toDelete))
+	display.Print("\nFiles eligible for recoverable movement (%d):", len(toDelete))
 	for _, d := range toDelete {
-		display.Print("  %s", d.file.BaseName+"."+d.file.Ext)
+		display.Print("  %s%s", d.file.FullPath, d.note)
 	}
 
-	// Soft-delete moves files into ~/.Trash via rename, which only works when the
-	// camera and the Trash share a volume. Camera cards mount separately, so fall
-	// back to a permanent delete — safe because every file above passed all eight
-	// checks against a verified HD backup.
-	permanentXVol := false
-	if cfg.SoftDelete {
-		if same, err := trash.SameVolumeAsTrash(toDelete[0].file.FullPath); err == nil && !same {
-			permanentXVol = true
-		}
-	}
-	if permanentXVol {
-		display.Print("\nNote: the camera is on a different volume than ~/.Trash, so these files will be")
-		display.Print("permanently deleted (not recoverable from Trash). All have verified HD backups.")
-	}
+	display.Print("\nCamera: %s; backup: %s (%s)", dc.VolumePath, hdRoot(cfg), hdIdentity.UUID)
+	display.Print("Files will move to %s. Recovery occupies card space and never expires.", filepath.Join(dc.VolumePath, ".reel-trash"))
 
 	if *dryRun {
 		display.Print("\n--dry-run: no files deleted.")
@@ -220,51 +145,70 @@ func RunClean(args []string) error {
 	}
 
 	// Confirm
-	if !cfg.SoftDelete {
-		fmt.Printf("\nWARNING: soft_delete is disabled. Files will be permanently deleted.\n")
-	}
-	fmt.Printf("\nDelete %d files? [y/N]: ", len(toDelete))
+
+	fmt.Printf("\nMove %d files to recovery? [y/N]: ", len(toDelete))
 	reader := bufio.NewReader(os.Stdin)
 	answer, _ := reader.ReadString('\n')
 	answer = strings.TrimSpace(strings.ToLower(answer))
 	if answer != "y" && answer != "yes" {
-		display.Print("Aborted.")
-		return nil
+		return fmt.Errorf("clean cancelled")
 	}
 
-	// Delete
-	deleteTs := time.Now()
-	var deleted, failedDel int
+	deleted, err := executeCleanPlan(toDelete, st, dc.VolumePath, true)
+	display.Print("\nClean result: %d moved to recovery.", deleted)
+	if e := mirrorStateToHD(cfg, st); err == nil {
+		err = e
+	}
+	return err
+}
+
+// executeCleanPlan is shared by the interactive command and fixture tests.
+// It performs no prompting and never handles a dry run.
+func executeCleanPlan(toDelete []cleanCandidate, st *state.Store, volume string, softDelete bool) (int, error) {
+	if !softDelete {
+		return 0, fmt.Errorf("permanent deletion is unavailable")
+	}
+	// Recheck the entire plan after confirmation, before moving any files.
 	for _, d := range toDelete {
-		filename := d.file.BaseName + "." + d.file.Ext
-		var delErr error
-		if cfg.SoftDelete && !permanentXVol {
-			_, delErr = trash.Move(d.file.FullPath, deleteTs)
-			if errors.Is(delErr, trash.ErrCrossDevice) {
-				// Volume check missed it (e.g. an unusual mount); delete permanently.
-				delErr = os.Remove(d.file.FullPath)
+		if d.validate != nil {
+			if err := d.validate(); err != nil {
+				return 0, err
 			}
-		} else {
-			delErr = os.Remove(d.file.FullPath)
+		}
+		for _, snapshot := range d.snapshots {
+			if err := snapshot.check(); err != nil {
+				return 0, fmt.Errorf("camera/backup changed after verification; rerun clean: %w", err)
+			}
+		}
+	}
+
+	deleteTs := time.Now()
+	deleted := 0
+	for _, d := range toDelete {
+		for _, snapshot := range d.snapshots {
+			if err := snapshot.check(); err != nil {
+				return deleted, fmt.Errorf("clean stopped; camera/backup changed: %w", err)
+			}
+		}
+		filename := d.file.BaseName + "." + d.file.Ext
+		if d.validate != nil {
+			if err := d.validate(); err != nil {
+				return deleted, err
+			}
+		}
+		dest, delErr := trash.MoveOnVolume(d.file.FullPath, volume, deleteTs)
+		if dest != "" {
+			display.Print("  Recoverable: %s", dest)
 		}
 		if delErr != nil {
-			display.Error("delete %s: %v", filename, delErr)
-			failedDel++
-			continue
+			return deleted, fmt.Errorf("clean stopped at %s: %w", filename, delErr)
 		}
+		deleted++
 		now := time.Now().UTC()
 		d.row.CleanedAt = &now
 		if err := st.Upsert(d.row); err != nil {
-			display.Error("save state for %s: %v", filename, err)
+			return deleted, fmt.Errorf("save state for %s (file already removed from camera folder): %w", filename, err)
 		}
-		deleted++
 	}
-
-	if permanentXVol {
-		display.Print("\nClean complete: %d permanently deleted, %d failed.", deleted, failedDel)
-	} else {
-		display.Print("\nClean complete: %d deleted, %d failed.", deleted, failedDel)
-	}
-	mirrorStateToHD(cfg, st)
-	return nil
+	return deleted, nil
 }

@@ -82,12 +82,12 @@ class QuarantineTests(unittest.TestCase):
 
     def test_missing_companion_aborts_plan(self):
         self.mp4.rename(self.mp4.with_suffix('.other'))
-        with self.assertRaises(ValueError):
+        with self.assertRaises((ValueError, OSError)):
             self.plan()
 
     def test_symlink_aborts_plan(self):
         (self.root/'link.LRF').symlink_to(self.lrf)
-        with self.assertRaises(ValueError):
+        with self.assertRaises((ValueError, OSError)):
             self.plan()
 
     def test_restore_after_interruption_before_state_update(self):
@@ -103,6 +103,44 @@ class QuarantineTests(unittest.TestCase):
         p = self.plan()
         self.row['hd_path'] = '/another/backup.LRF'
         self.state.write_text(json.dumps(self.row)+'\n'+json.dumps(self.other)+'\n')
+        with self.assertRaises(ValueError):
+            q.execute(p)
+        self.assertTrue(self.lrf.exists())
+
+    def test_helper_aliases_preserve_mp4_and_lrf(self):
+        import os
+        for kind in ('symlink', 'hardlink'):
+            with self.subTest(kind=kind):
+                p = self.plan()
+                self.recovery.mkdir()
+                helper = self.recovery/'restore_lrf.py'
+                if kind == 'symlink':
+                    helper.symlink_to(self.mp4)
+                else:
+                    os.link(self.mp4, helper)
+                with self.assertRaises((ValueError, OSError)):
+                    q.execute(p)
+                self.assertEqual(self.mp4.read_bytes(), b'original video contents')
+                self.assertTrue(self.lrf.exists())
+                import shutil
+                shutil.rmtree(self.recovery)
+
+    def test_conflicting_artifact_stops_before_move(self):
+        p = self.plan()
+        self.recovery.mkdir()
+        helper = self.recovery/'RESTORE.txt'
+        helper.write_text('keep this')
+        with self.assertRaises(ValueError):
+            q.execute(p)
+        self.assertEqual(helper.read_text(), 'keep this')
+        self.assertTrue(self.lrf.exists())
+
+    def test_same_metadata_content_change_is_rejected(self):
+        import os
+        p = self.plan()
+        info = self.mp4.stat()
+        self.mp4.write_bytes(b'x'*info.st_size)
+        os.utime(self.mp4, ns=(info.st_atime_ns, info.st_mtime_ns))
         with self.assertRaises(ValueError):
             q.execute(p)
         self.assertTrue(self.lrf.exists())

@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/pspenano/reel/internal/lockfile"
 	"github.com/pspenano/reel/internal/state"
 	"github.com/pspenano/reel/internal/transfer"
+	"github.com/pspenano/reel/internal/volume"
 )
 
 // RunImport implements `reel import`.
@@ -20,13 +23,16 @@ func RunImport(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unsupported arguments: %v", fs.Args())
+	}
 
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	cfgDir, err := config.Dir()
+	cfgDir, err := configDir()
 	if err != nil {
 		return err
 	}
@@ -41,11 +47,7 @@ func RunImport(args []string) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	if cleaned, _ := transfer.SweepOrphanTmps(cfg.LaptopDir); len(cleaned) > 0 {
-		display.Info("Cleaned %d orphan .tmp file(s) from previous run.", len(cleaned))
-	}
-
-	cameras, err := camera.Detect(cfg.Cameras)
+	cameras, err := detectCameras(cfg.Cameras)
 	if err != nil {
 		return fmt.Errorf("detect cameras: %w", err)
 	}
@@ -54,9 +56,21 @@ func RunImport(args []string) error {
 		return nil
 	}
 
+	if len(cameras) != 1 {
+		return fmt.Errorf("multiple cameras detected; connect exactly one camera")
+	}
 	dc := &cameras[0]
 	display.Info("Camera: %s (%s)", dc.Profile.Name, dc.VolumePath)
 
+	cameraIdentity, err := resolveVolume(dc.VolumePath)
+	if err != nil {
+		return err
+	}
+	cardLock, err := lockfile.AcquireExclusive(filepath.Join(dc.VolumePath, "reel.lock"))
+	if err != nil {
+		return err
+	}
+	defer cardLock.Release()
 	files, err := dc.Walk()
 	if err != nil {
 		return fmt.Errorf("walk DCIM: %w", err)
@@ -66,6 +80,15 @@ func RunImport(args []string) error {
 		return nil
 	}
 
+	for _, f := range files {
+		if err := volume.Contains(dc.VolumePath, f.FullPath); err != nil {
+			return err
+		}
+	}
+	if err := validateCameraBatch(files); err != nil {
+		return err
+	}
+
 	// Filter already-imported
 	var toImport []camera.File
 	for _, f := range files {
@@ -73,8 +96,17 @@ func RunImport(args []string) error {
 			continue
 		}
 		existing := st.GetByParts(f.Profile.Name, f.BaseName, f.Ext)
-		if existing != nil && existing.LaptopPath != "" {
-			continue
+		if existing != nil {
+			if existing.CameraPath != "" && filepath.Clean(existing.CameraPath) != filepath.Clean(f.FullPath) {
+				return fmt.Errorf("recording path conflicts with existing identity: %s", f.FullPath)
+			}
+			ok, err := validatedCopy(f.FullPath, existing.LaptopPath, existing.SHA256)
+			if err != nil {
+				return err
+			}
+			if ok {
+				continue
+			}
 		}
 		toImport = append(toImport, f)
 	}
@@ -93,6 +125,11 @@ func RunImport(args []string) error {
 	folderName := minTime.UTC().Format("2006-01-02_150405")
 	destDir := filepath.Join(cfg.LaptopDir, folderName)
 
+	for _, f := range toImport {
+		if err := transfer.Preflight(f.FullPath, filepath.Join(destDir, f.BaseName+"."+f.Ext), canonicalHash(st, f)); err != nil {
+			return err
+		}
+	}
 	var totalBytes int64
 	for _, f := range toImport {
 		totalBytes += f.Size
@@ -110,7 +147,10 @@ func RunImport(args []string) error {
 		filename := f.BaseName + "." + f.Ext
 		display.Progress("[%d/%d] %s", i+1, len(toImport), filename)
 
-		result, err := transfer.Copy(f.FullPath, destDir, filename, f.RecordedAt, "")
+		if err := checkVolume(cameraIdentity); err != nil {
+			return err
+		}
+		result, err := transfer.CopyChecked(f.FullPath, destDir, filename, f.RecordedAt, canonicalHash(st, f), func() error { return checkVolume(cameraIdentity) })
 		if err != nil {
 			if abort := handleTransferError(err, filename, filepath.Dir(f.FullPath), destDir); abort {
 				failed++
@@ -144,14 +184,20 @@ func RunImport(args []string) error {
 			}
 		}
 		if err := st.Upsert(row); err != nil {
-			display.Error("save state for %s: %v", filename, err)
+			return fmt.Errorf("stopped: %d committed, 1 published without state, %d not attempted; save %s: %w", imported, len(toImport)-i-1, filename, err)
 		}
 		imported++
 	}
 	display.ClearProgress()
 
 	// Mirror state to HD if connected
-	mirrorStateToHD(cfg, st)
+	if _, e := os.Stat(hdRoot(cfg)); e == nil {
+		if e := mirrorStateToHD(cfg, st); e != nil {
+			return e
+		}
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return fmt.Errorf("optional mirror unavailable: %w", e)
+	}
 
 	if aborted {
 		return fmt.Errorf("aborted after %d imported, %d failed, %d not attempted", imported, failed, remaining)
@@ -161,9 +207,9 @@ func RunImport(args []string) error {
 }
 
 // mirrorStateToHD copies the state file to the HD if it's connected.
-func mirrorStateToHD(cfg *config.Config, st *state.Store) {
-	hdPath := cfg.HDStatePath()
-	if err := st.MirrorTo(hdPath); err != nil {
-		display.Warn("mirror state to HD: %v", err)
+func mirrorStateToHD(cfg *config.Config, st *state.Store) error {
+	if _, err := approvedHD(cfg); err != nil {
+		return err
 	}
+	return st.MirrorTo(hdState(cfg))
 }

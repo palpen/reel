@@ -1,0 +1,21 @@
+name: Media preservation
+on: [push, pull_request]
+jobs:
+  preservation:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        go: ['1.22.x', 'stable']
+        python: ['3.9', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: go test -race -count=1 ./...
+      - run: python -m unittest discover -s scripts -v
+      - run: go vet ./...
+      - run: go build -ldflags "-X main.version=${GITHUB_SHA}-safety" -o reel .

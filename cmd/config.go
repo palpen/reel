@@ -4,6 +4,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/pspenano/reel/internal/config"
 	"github.com/pspenano/reel/internal/display"
@@ -16,10 +18,20 @@ func RunConfig(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unsupported arguments: %v", fs.Args())
+	}
 
-	existing, err := config.Load()
+	existing, err := loadConfig()
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		dir, e := configDir()
+		if e != nil {
+			return e
+		}
+		if _, e = os.Stat(filepath.Join(dir, "config.json")); !os.IsNotExist(e) {
+			return err
+		}
+		existing = nil
 	}
 
 	updated, err := config.EditConfig(existing)
@@ -31,6 +43,11 @@ func RunConfig(args []string) error {
 		return err
 	}
 
+	id, err := resolveVolume(updated.HDRoot())
+	if err != nil {
+		return err
+	}
+	updated.HDVolumeUUID = id.UUID
 	if err := config.Save(updated); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}

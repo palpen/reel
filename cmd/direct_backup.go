@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/pspenano/reel/internal/camera"
-	"github.com/pspenano/reel/internal/config"
 	"github.com/pspenano/reel/internal/display"
 	"github.com/pspenano/reel/internal/lockfile"
 	"github.com/pspenano/reel/internal/state"
 	"github.com/pspenano/reel/internal/transfer"
+	"github.com/pspenano/reel/internal/volume"
 )
 
 // RunDirectBackup implements `reel direct_backup` (camera → HD, skipping laptop).
@@ -20,13 +20,20 @@ func RunDirectBackup(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unsupported arguments: %v", fs.Args())
+	}
 
-	cfg, err := config.Load()
+	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	cfgDir, err := config.Dir()
+	hdIdentity, err := approvedHD(cfg)
+	if err != nil {
+		return err
+	}
+	cfgDir, err := configDir()
 	if err != nil {
 		return err
 	}
@@ -36,16 +43,18 @@ func RunDirectBackup(args []string) error {
 	}
 	defer lk.Release()
 
+	archive, err := archiveLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer archive.Release()
+
 	st, err := state.Load(filepath.Join(cfgDir, "state.jsonl"))
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	if cleaned, _ := transfer.SweepOrphanTmps(cfg.HDManagedDir()); len(cleaned) > 0 {
-		display.Info("Cleaned %d orphan .tmp file(s) from previous run.", len(cleaned))
-	}
-
-	cameras, err := camera.Detect(cfg.Cameras)
+	cameras, err := detectCameras(cfg.Cameras)
 	if err != nil {
 		return fmt.Errorf("detect cameras: %w", err)
 	}
@@ -54,12 +63,33 @@ func RunDirectBackup(args []string) error {
 		return nil
 	}
 
+	if len(cameras) != 1 {
+		return fmt.Errorf("multiple cameras detected; connect exactly one camera")
+	}
 	dc := &cameras[0]
 	display.Info("Camera: %s (%s)", dc.Profile.Name, dc.VolumePath)
 
+	cameraIdentity, err := resolveVolume(dc.VolumePath)
+	if err != nil {
+		return err
+	}
+	cardLock, err := lockfile.AcquireExclusive(filepath.Join(dc.VolumePath, "reel.lock"))
+	if err != nil {
+		return err
+	}
+	defer cardLock.Release()
 	files, err := dc.Walk()
 	if err != nil {
 		return fmt.Errorf("walk DCIM: %w", err)
+	}
+
+	for _, f := range files {
+		if err := volume.Contains(dc.VolumePath, f.FullPath); err != nil {
+			return err
+		}
+	}
+	if err := validateCameraBatch(files); err != nil {
+		return err
 	}
 
 	// Filter: only files without hd_path
@@ -69,8 +99,17 @@ func RunDirectBackup(args []string) error {
 			continue
 		}
 		existing := st.GetByParts(f.Profile.Name, f.BaseName, f.Ext)
-		if existing != nil && existing.HDPath != "" {
-			continue
+		if existing != nil {
+			if existing.CameraPath != "" && filepath.Clean(existing.CameraPath) != filepath.Clean(f.FullPath) {
+				return fmt.Errorf("recording path conflicts with existing identity: %s", f.FullPath)
+			}
+			ok, err := validatedCopy(f.FullPath, existing.HDPath, existing.SHA256)
+			if err != nil {
+				return err
+			}
+			if ok {
+				continue
+			}
 		}
 		toBackup = append(toBackup, f)
 	}
@@ -79,8 +118,13 @@ func RunDirectBackup(args []string) error {
 		return nil
 	}
 
-	hdDir := cfg.HDManagedDir()
+	hdDir := hdManaged(cfg)
 
+	for _, f := range toBackup {
+		if err := transfer.Preflight(f.FullPath, filepath.Join(hdDir, f.BaseName+"."+f.Ext), canonicalHash(st, f)); err != nil {
+			return err
+		}
+	}
 	var totalBytes int64
 	for _, f := range toBackup {
 		totalBytes += f.Size
@@ -98,7 +142,18 @@ func RunDirectBackup(args []string) error {
 		filename := f.BaseName + "." + f.Ext
 		display.Progress("[%d/%d] %s", i+1, len(toBackup), filename)
 
-		result, err := transfer.Copy(f.FullPath, hdDir, filename, f.RecordedAt, "")
+		if err := checkVolume(hdIdentity); err != nil {
+			return err
+		}
+		if err := checkVolume(cameraIdentity); err != nil {
+			return err
+		}
+		result, err := transfer.CopyChecked(f.FullPath, hdDir, filename, f.RecordedAt, canonicalHash(st, f), func() error {
+			if err := checkVolume(cameraIdentity); err != nil {
+				return err
+			}
+			return checkVolume(hdIdentity)
+		})
 		if err != nil {
 			if abort := handleTransferError(err, filename, filepath.Dir(f.FullPath), hdDir); abort {
 				failed++
@@ -133,14 +188,17 @@ func RunDirectBackup(args []string) error {
 				row.SHA256 = result.SHA256
 			}
 		}
+		row.HDVolumeUUID = hdIdentity.UUID
 		if err := st.Upsert(row); err != nil {
-			display.Error("save state for %s: %v", filename, err)
+			return fmt.Errorf("stopped: %d committed, 1 published without state, %d not attempted; save %s: %w", backed, len(toBackup)-i-1, filename, err)
 		}
 		backed++
 	}
 	display.ClearProgress()
 
-	mirrorStateToHD(cfg, st)
+	if e := mirrorStateToHD(cfg, st); e != nil {
+		return e
+	}
 
 	if aborted {
 		return fmt.Errorf("aborted after %d backed up, %d failed, %d not attempted", backed, failed, remaining)

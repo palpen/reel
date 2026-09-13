@@ -9,7 +9,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/pspenano/reel/internal/config"
 	"github.com/pspenano/reel/internal/display"
 	"github.com/pspenano/reel/internal/lockfile"
 	"github.com/pspenano/reel/internal/state"
@@ -36,6 +35,9 @@ func RunHistory(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unsupported arguments: %v", fs.Args())
+	}
 
 	if *typeFilter != "" {
 		switch *typeFilter {
@@ -45,12 +47,12 @@ func RunHistory(args []string) error {
 		}
 	}
 
-	_, err := config.Load()
+	_, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	cfgDir, err := config.Dir()
+	cfgDir, err := configDir()
 	if err != nil {
 		return err
 	}

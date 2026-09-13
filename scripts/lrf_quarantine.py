@@ -13,61 +13,136 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
+import hashlib
 import stat
 import sys
 import tempfile
 
 
+@contextlib.contextmanager
+def directory(path, create=False):
+    path = Path(path).absolute()
+    if '..' in path.parts:
+        raise ValueError('Path traversal')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = new
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def regular(fd):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError('Expected regular unaliased file')
+    return info
+
+
 def fingerprint(path):
     path = Path(path)
-    if path.resolve() != path.absolute():
-        raise ValueError(f"Symlink in path: {path}")
-    s = path.lstat()
-    if not stat.S_ISREG(s.st_mode):
-        raise ValueError(f"Not a regular file: {path}")
-    return dict(device=s.st_dev, inode=s.st_ino, size=s.st_size, mtime_ns=s.st_mtime_ns)
+    with directory(path.parent) as parent:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            s = regular(fd)
+            h = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024*1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+            after = regular(fd)
+            if (s.st_size, s.st_mtime_ns, s.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError('File changed while hashing')
+            return dict(device=s.st_dev, inode=s.st_ino, size=s.st_size, mtime_ns=s.st_mtime_ns, sha256=h.hexdigest())
+        finally:
+            os.close(fd)
 
 
 def check(path, expected):
-    if fingerprint(path) != expected:
+    current = fingerprint(path)
+    # Legacy manifests lack hashes; accept metadata only for standalone recovery.
+    if any(current.get(k) != v for k, v in expected.items()):
         raise ValueError(f"File changed since planning: {path}")
+
+
+def artifact(path, data, create=True):
+    """Create exclusively, or reuse an identical regular unaliased artifact."""
+    path = Path(path)
+    data = data.encode() if isinstance(data, str) else data
+    with directory(path.parent) as parent:
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        except FileNotFoundError:
+            if not create:
+                return
+            fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.fsync(parent)
+        else:
+            with os.fdopen(fd, 'rb') as f:
+                regular(f.fileno())
+                if f.read() != data:
+                    raise ValueError(f'Conflicting recovery artifact: {path}')
 
 
 def atomic_write(path, data):
     path = Path(path)
-    if path.is_symlink():
-        raise ValueError(f"Symlink: {path}")
-    fd, tmp = tempfile.mkstemp(prefix='.reel-recovery-', dir=path.parent)
-    try:
+    with directory(path.parent) as parent:
+        # Metadata replacement never follows aliases or applies to media.
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            regular(fd)
+        finally:
+            os.close(fd)
+        name = '.reel-state-' + os.urandom(16).hex()
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
         with os.fdopen(fd, 'w') as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)  # Only our temporary metadata file; never media.
+        os.rename(name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
 
 
 def exclusive_move(src, dst):
     if sys.platform != 'darwin':
         raise RuntimeError('Exclusive rename implementation requires macOS')
-    if Path(dst).parent.resolve() != Path(dst).parent.absolute():
-        raise ValueError(f"Symlink in destination: {dst}")
-    if os.stat(src).st_dev != os.stat(Path(dst).parent).st_dev:
-        raise ValueError('Cross-volume move refused')
-    lib = ctypes.CDLL(None, use_errno=True)
-    rename = lib.renamex_np
-    rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-    rename.restype = ctypes.c_int
-    if rename(os.fsencode(src), os.fsencode(dst), 4):  # RENAME_EXCL
-        raise OSError(ctypes.get_errno(), f'Exclusive rename failed: {src} -> {dst}')
+    src, dst = Path(src), Path(dst)
+    with directory(src.parent) as a, directory(dst.parent) as b:
+        if os.fstat(a).st_dev != os.fstat(b).st_dev:
+            raise ValueError('Cross-volume move refused')
+        lib = ctypes.CDLL(None, use_errno=True)
+        rename = lib.renameatx_np
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(a, os.fsencode(src.name), b, os.fsencode(dst.name), 4):
+            raise OSError(ctypes.get_errno(), f'Exclusive rename failed: {src} -> {dst}')
+        os.fsync(b)
+        os.fsync(a)
 
 
 def read_rows(path):
-    text = Path(path).read_text()
+    path = Path(path)
+    with directory(path.parent) as parent:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd) as f:
+            regular(f.fileno())
+            text = f.read()
     rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if any(r.get("schema_version", 1) not in (1, 2) for r in rows):
+        raise ValueError("Unsupported state schema")
     keys = [key(r) for r in rows]
     if len(keys) != len(set(keys)):
         raise ValueError(f'Duplicate state keys: {path}')
@@ -100,6 +175,8 @@ def plan(root, quarantine, states, lock):
             if Path(directory, name).is_symlink():
                 raise ValueError(f'Symlink directory: {directory}/{name}')
         for name in sorted(files):
+            if name in ('reel.lock', '.reel-archive.lock', '.reel-protocol.json'):
+                continue
             src = Path(directory, name)
             info = fingerprint(src)
             if info['device'] != device:
@@ -165,17 +242,41 @@ def state_updates(p, restore):
 
 @contextlib.contextmanager
 def locked(path):
-    if not path:
+    path = Path(path)
+    with directory(path.parent) as parent:
+        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
+        try:
+            regular(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(fd)  # Permanent lockfile: never unlink.
+
+
+@contextlib.contextmanager
+def transaction_locks(p):
+    # Same ordering as Go: local state directories, then shared archive root.
+    local = {str(Path(s['path']).parent/'reel.lock') for s in p['states'] if Path(s['path']).name != '.reel-state.jsonl'}
+    mirrors = {str(Path(s['path']).parent/'reel.lock') for s in p['states'] if Path(s['path']).name == '.reel-state.jsonl'}
+    if p.get('lock'):
+        local.add(str(Path(p['lock']).absolute()))
+    archive = str(Path(p['root'])/'.reel-archive.lock')
+    media = str(Path(p['root'])/'reel.lock')
+    with contextlib.ExitStack() as stack:
+        acquired = set()
+        for path in sorted(local) + [archive, media] + sorted(mirrors):
+            if path not in acquired:
+                stack.enter_context(locked(path))
+                acquired.add(path)
+        marker = Path(p['root'])/'.reel-protocol.json'
+        artifact(marker, '{"version":2,"media_publication":"exclusive","recovery":"retain"}\n')
         yield
-        return
-    with open(path, 'a+') as f:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
-        # Leave the lockfile in place: unlinking can break concurrent locking.
 
 
 def execute(p, restore=False):
-    with locked(p.get('lock')):
+    with transaction_locks(p):
+        if p.get('version') != 1:
+            raise ValueError('Unsupported manifest version')
         root, quarantine = Path(p['root']), Path(p['quarantine'])
         if root.resolve() != root or quarantine.resolve() != quarantine:
             raise ValueError('Symlink in root/quarantine')
@@ -197,22 +298,29 @@ def execute(p, restore=False):
             check(src if os.path.lexists(src) else dst, entry['fingerprint'])
             if os.path.lexists(src):
                 pending.append((src, dst, entry['fingerprint']))
-        if not restore:
-            quarantine.mkdir(parents=True, exist_ok=True)
-            manifest = quarantine/'manifest.json'
-            if manifest.exists() and json.loads(manifest.read_text()) != p:
-                raise ValueError('Quarantine belongs to another plan')
-            atomic_write(manifest, json.dumps(p, indent=2)+'\n')
-            if Path(__file__).resolve() != quarantine/'restore_lrf.py':
-                shutil.copy2(__file__, quarantine/'restore_lrf.py')
-            atomic_write(quarantine/'RESTORE.txt',
-                         'Files are quarantined, not deleted. No automatic expiry.\n'
-                         'To restore files and their reel state paths, with reel idle:\n'
-                         'python3 "'+str(quarantine/'restore_lrf.py')+'" restore "'+str(manifest)+'"\n'
-                         'This refuses overwrites and changes to the recorded files.\n'
-                         'Unrelated file changes may require a manual review before restoration.\n')
+        # Preflight every destination parent before the first media move.
         for src, dst, expected in pending:
-            Path(dst).parent.mkdir(parents=True, exist_ok=True)
+            with directory(Path(dst).parent, create=True):
+                pass
+        if not restore:
+            with directory(quarantine, create=True):
+                pass
+            manifest = quarantine/'manifest.json'
+            artifacts = {
+                manifest: json.dumps(p, indent=2)+'\n',
+                quarantine/'restore_lrf.py': Path(__file__).read_bytes(),
+                quarantine/'RESTORE.txt':
+                    'Files are quarantined, not deleted. No automatic expiry.\n'
+                    'To restore files and their reel state paths:\n'
+                    'python3 "'+str(quarantine/'restore_lrf.py')+'" restore "'+str(manifest)+'"\n'
+                    'This refuses overwrites and changes to the recorded files.\n',
+            }
+            # A conflict in any artifact fails before creating/reusing the others.
+            for path, data in artifacts.items():
+                artifact(path, data, create=False)
+            for path, data in artifacts.items():
+                artifact(path, data)
+        for src, dst, expected in pending:
             check(src, expected)
             exclusive_move(src, dst)
             check(dst, expected)

@@ -8,9 +8,9 @@ import (
 )
 
 var (
-	baseTime      = time.Date(2026, 5, 10, 11, 18, 26, 0, time.UTC)
-	recentVerify  = baseTime.Add(-1 * time.Hour)          // 1h ago — fresh
-	staleVerify   = baseTime.Add(-8 * 24 * time.Hour)     // 8d ago — stale
+	baseTime       = time.Date(2026, 5, 10, 11, 18, 26, 0, time.UTC)
+	recentVerify   = baseTime.Add(-1 * time.Hour)      // 1h ago — fresh
+	staleVerify    = baseTime.Add(-8 * 24 * time.Hour) // 8d ago — stale
 	staleThreshold = 7 * 24 * time.Hour
 )
 
@@ -224,17 +224,15 @@ func TestShouldDelete(t *testing.T) {
 			wantDelete: true,
 			wantReason: "",
 		},
-		// D5 with matching empty strings (both empty = match — this is intentional for "no hash yet")
-		// In practice StateSHA256="" means we should catch it via D5 but only if HDFileSHA256 != StateSHA256
-		// Empty == Empty is actually a match — but in goodState both are "abc123" so this tests only empty-HD
+		// Missing hashes never establish a verified backup.
 		{
 			name: "D5_both_empty_hashes",
 			mutate: func(s *clean.FileState) {
 				s.HDFileSHA256 = ""
 				s.StateSHA256 = ""
 			},
-			wantDelete: true, // both empty strings are equal
-			wantReason: "",
+			wantDelete: false,
+			wantReason: "HD file hash mismatch",
 		},
 	}
 

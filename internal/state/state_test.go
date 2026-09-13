@@ -2,7 +2,10 @@ package state_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"github.com/pspenano/reel/internal/fault"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -25,7 +28,7 @@ func makeRow(profile, base, ext string) *state.Row {
 }
 
 func TestRoundTrip(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	path := filepath.Join(dir, "state.jsonl")
 
 	st, err := state.Load(path)
@@ -68,7 +71,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestAtomicWrite(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	path := filepath.Join(dir, "state.jsonl")
 
 	st, _ := state.Load(path)
@@ -88,7 +91,7 @@ func TestAtomicWrite(t *testing.T) {
 }
 
 func TestStaleTmpCleanup(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	path := filepath.Join(dir, "state.jsonl")
 	tmp := path + ".tmp"
 
@@ -100,13 +103,13 @@ func TestStaleTmpCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
-		t.Error("stale .tmp was not cleaned up on load")
+	if _, err := os.Stat(tmp); err != nil {
+		t.Error("read-only load removed a partial")
 	}
 }
 
 func TestDuplicateKeyWarning(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	path := filepath.Join(dir, "state.jsonl")
 
 	// Write a file with two rows with the same key
@@ -114,23 +117,13 @@ func TestDuplicateKeyWarning(t *testing.T) {
 		`{"schema_version":1,"camera_profile":"DJI Pocket 3","base_name":"DJI_20260510111826_0001_D","ext":"MP4","sha256":"second"}` + "\n"
 	os.WriteFile(path, []byte(line), 0o600)
 
-	// Should load without error; last row wins
-	st, err := state.Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	got := st.GetByParts("DJI Pocket 3", "DJI_20260510111826_0001_D", "MP4")
-	if got == nil {
-		t.Fatal("row not found")
-	}
-	// Second row should win
-	if got.SHA256 != "second" {
-		t.Errorf("SHA256 = %q, want %q", got.SHA256, "second")
+	if _, err := state.Load(path); err == nil {
+		t.Fatal("ambiguous state accepted")
 	}
 }
 
 func TestForwardCompatibility(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	path := filepath.Join(dir, "state.jsonl")
 
 	// Write a row with an unknown field
@@ -164,7 +157,7 @@ func TestForwardCompatibility(t *testing.T) {
 }
 
 func TestUpsertUpdates(t *testing.T) {
-	dir := t.TempDir()
+	dir := realTempDir(t)
 	path := filepath.Join(dir, "state.jsonl")
 
 	st, _ := state.Load(path)
@@ -172,7 +165,7 @@ func TestUpsertUpdates(t *testing.T) {
 	st.Upsert(r)
 
 	// Update
-	r.SHA256 = "updated"
+	r.LaptopPath = "/updated/path"
 	now := time.Now().UTC()
 	r.ImportedAt = &now
 	st.Upsert(r)
@@ -180,8 +173,8 @@ func TestUpsertUpdates(t *testing.T) {
 	// Reload
 	st2, _ := state.Load(path)
 	got := st2.GetByParts("DJI Pocket 3", "DJI_20260510111826_0001_D", "MP4")
-	if got.SHA256 != "updated" {
-		t.Errorf("SHA256 = %q, want %q", got.SHA256, "updated")
+	if got.LaptopPath != "/updated/path" {
+		t.Errorf("LaptopPath = %q", got.LaptopPath)
 	}
 	if got.ImportedAt == nil {
 		t.Error("ImportedAt should be set")
@@ -205,4 +198,109 @@ func splitLines(data []byte) [][]byte {
 		lines = append(lines, data[start:])
 	}
 	return lines
+}
+
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	p, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestFailedPersistenceDoesNotCommitMemory(t *testing.T) {
+	root := realTempDir(t)
+	s, err := state.Load(filepath.Join(root, "state.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := makeRow("camera", "clip", "MP4")
+	if err = s.Upsert(r); err != nil {
+		t.Fatal(err)
+	}
+	r = s.All()[0]
+	r.LaptopPath = "changed"
+	fault.Hook = func(name string) error {
+		if name == "state-save" {
+			return fmt.Errorf("injected save failure")
+		}
+		return nil
+	}
+	defer func() { fault.Hook = nil }()
+	if err = s.Upsert(r); err == nil {
+		t.Fatal("save failure ignored")
+	}
+	if s.All()[0].LaptopPath == "changed" {
+		t.Fatal("failed save committed to memory")
+	}
+}
+
+func TestMirrorMergesHistoryAndRejectsConflicts(t *testing.T) {
+	root := realTempDir(t)
+	a, _ := state.Load(filepath.Join(root, "a.jsonl"))
+	b, _ := state.Load(filepath.Join(root, "b.jsonl"))
+	mirror := filepath.Join(root, "mirror.jsonl")
+	one, two := makeRow("camera", "one", "MP4"), makeRow("camera", "two", "MP4")
+	a.Upsert(one)
+	b.Upsert(two)
+	if err := a.MirrorTo(mirror); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.MirrorTo(mirror); err != nil {
+		t.Fatal(err)
+	}
+	m, err := state.Load(mirror)
+	if err != nil || m.Len() != 2 {
+		t.Fatal("mirror erased unrelated history", err)
+	}
+	c, _ := state.Load(filepath.Join(root, "c.jsonl"))
+	one.SHA256 = "conflict"
+	c.Upsert(one)
+	before, _ := os.ReadFile(mirror)
+	if err := c.MirrorTo(mirror); err == nil {
+		t.Fatal("mirror accepted conflicting identity")
+	}
+	after, _ := os.ReadFile(mirror)
+	if string(before) != string(after) {
+		t.Fatal("conflict changed mirror")
+	}
+}
+
+func TestIndependentProcessMirrorsMerge(t *testing.T) {
+	if root := os.Getenv("REEL_TEST_MIRROR_ROOT"); root != "" {
+		name := os.Getenv("REEL_TEST_MIRROR_CLIENT")
+		s, e := state.Load(filepath.Join(root, name+".jsonl"))
+		if e != nil {
+			os.Exit(40)
+		}
+		r := makeRow("camera", name, "MP4")
+		if s.Upsert(r) != nil || s.MirrorTo(filepath.Join(root, "mirror.jsonl")) != nil {
+			os.Exit(41)
+		}
+		os.Exit(0)
+	}
+	root := realTempDir(t)
+	makeChild := func(name string) *exec.Cmd {
+		c := exec.Command(os.Args[0], "-test.run=^TestIndependentProcessMirrorsMerge$")
+		c.Env = append(os.Environ(), "REEL_TEST_MIRROR_ROOT="+root, "REEL_TEST_MIRROR_CLIENT="+name)
+		return c
+	}
+	a, b := makeChild("one"), makeChild("two")
+	if e := a.Start(); e != nil {
+		t.Fatal(e)
+	}
+	if e := b.Start(); e != nil {
+		t.Fatal(e)
+	}
+	if e := a.Wait(); e != nil {
+		t.Fatal(e)
+	}
+	if e := b.Wait(); e != nil {
+		t.Fatal(e)
+	}
+	s, e := state.Load(filepath.Join(root, "mirror.jsonl"))
+	if e != nil || s.Len() != 2 {
+		t.Fatal("concurrent history lost", e)
+	}
 }

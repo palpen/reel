@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pspenano/reel/internal/safefs"
+	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,8 @@ const configFile = "config.json"
 
 // ErrWizardAborted is returned when the user declines to save at the
 // confirmation step of the wizard.
+var ErrInvalid = errors.New("invalid configuration")
+
 var ErrWizardAborted = errors.New("wizard aborted by user")
 
 // CameraProfile describes one camera model's file-naming conventions.
@@ -35,15 +39,16 @@ type CameraProfile struct {
 type Config struct {
 	TransferExtensions []string        `json:"transfer_extensions"`
 	LaptopDir          string          `json:"laptop_dir"`
+	HDVolumeUUID       string          `json:"hd_volume_uuid,omitempty"`
 	HDVolumeName       string          `json:"hd_volume_name"`
 	HDDir              string          `json:"hd_dir"`
-	SoftDelete         bool            `json:"soft_delete"`
+	SoftDelete         bool            `json:"-"`
 	Cameras            []CameraProfile `json:"cameras"`
 }
 
 // ShouldTransfer applies to imports and both backup routes, including old state
 // rows. Omitted/null means MP4 only; an explicit empty list transfers nothing.
-// Camera recognition stays separate so clean retains its sibling safety checks.
+// Camera recognition stays separate from the cleaning policy for originals/previews.
 func (c *Config) ShouldTransfer(ext string) bool {
 	extensions := c.TransferExtensions
 	if extensions == nil {
@@ -75,22 +80,28 @@ func Load() (*Config, error) {
 	path := filepath.Join(dir, configFile)
 
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return runWizard(path)
+		return nil, fmt.Errorf("%w: configuration missing; run reel config to set up", ErrInvalid)
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg Config
+	cfg := Config{SoftDelete: true}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		return nil, fmt.Errorf("%w: parse config: %v", ErrInvalid, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	return &cfg, nil
 }
 
 // Save writes the config to disk atomically.
 func Save(cfg *Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	dir, err := Dir()
 	if err != nil {
 		return err
@@ -115,11 +126,30 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	dir, err := safefs.OpenDir(filepath.Dir(path), false)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer dir.Close()
+	f, err := safefs.Fresh(dir, ".reel-config-")
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = unix.Renameat(int(dir.Fd()), filepath.Base(f.Name()), int(dir.Fd()), filepath.Base(path)); err != nil {
+		return err
+	}
+	return dir.Sync()
 }
 
 // runWizard is the first-run entry point. Prompts the user for all config
@@ -151,7 +181,6 @@ func runInteractiveWizard(existing *Config) (*Config, error) {
 	w.askHDVolume()
 	w.askHDDir()
 	w.askLaptopDir()
-	w.askSoftDelete()
 
 	accepted, err := w.confirmOrEdit()
 	if err != nil {
@@ -234,15 +263,6 @@ func (w *wizardState) askLaptopDir() {
 	w.laptopDir = askPath(w.r, "Where should imported footage go on this laptop?", def, nil)
 }
 
-func (w *wizardState) askSoftDelete() {
-	def := "y"
-	if !w.softDelete {
-		def = "n"
-	}
-	answer := ask(w.r, "Use soft-delete (move to Trash instead of permanent delete)? [Y/n]", def)
-	w.softDelete = !strings.EqualFold(strings.TrimSpace(answer), "n")
-}
-
 func (w *wizardState) toConfig(existing *Config) *Config {
 	transferExtensions := []string{"MP4"}
 	if existing != nil {
@@ -263,7 +283,7 @@ func (w *wizardState) toConfig(existing *Config) *Config {
 		LaptopDir:          w.laptopDir,
 		HDVolumeName:       w.hdVolumeName,
 		HDDir:              w.hdDir,
-		SoftDelete:         w.softDelete,
+		SoftDelete:         true,
 		Cameras:            cameras,
 	}
 }
@@ -271,10 +291,6 @@ func (w *wizardState) toConfig(existing *Config) *Config {
 func (w *wizardState) printSummary() {
 	cameraResolved := filepath.Join("/Volumes", w.cameraVolume, w.mediaPath)
 	hdResolved := filepath.Join("/Volumes", w.hdVolumeName, w.hdDir)
-	soft := "no"
-	if w.softDelete {
-		soft = "yes"
-	}
 	fmt.Println()
 	fmt.Println("Review your configuration:")
 	fmt.Println()
@@ -285,7 +301,7 @@ func (w *wizardState) printSummary() {
 	fmt.Printf("  [4] HD folder:            %s\n", w.hdDir)
 	fmt.Printf("                            → %s\n", hdResolved)
 	fmt.Printf("  [5] Laptop folder:        %s\n", w.laptopDir)
-	fmt.Printf("  [6] Soft-delete:          %s\n", soft)
+	fmt.Println("  Cleaning: recoverable moves on the camera card")
 	fmt.Println()
 }
 
@@ -305,7 +321,7 @@ func (w *wizardState) confirmOrEdit() (bool, error) {
 		case "n", "no":
 			return false, nil
 		case "e", "edit":
-			fmt.Print("  Which field number (1-6)? ")
+			fmt.Print("  Which field number (1-5)? ")
 			pick, _ := w.r.ReadString('\n')
 			w.editField(strings.TrimSpace(pick))
 			continue
@@ -313,17 +329,17 @@ func (w *wizardState) confirmOrEdit() (bool, error) {
 
 		// Try parsing as a field number.
 		var n int
-		if _, err := fmt.Sscanf(line, "%d", &n); err == nil && n >= 1 && n <= 6 {
+		if _, err := fmt.Sscanf(line, "%d", &n); err == nil && n >= 1 && n <= 5 {
 			w.editByNumber(n)
 			continue
 		}
-		fmt.Println("  Please enter Y, n, or a field number (1-6).")
+		fmt.Println("  Please enter Y, n, or a field number (1-5).")
 	}
 }
 
 func (w *wizardState) editField(input string) {
 	var n int
-	if _, err := fmt.Sscanf(input, "%d", &n); err != nil || n < 1 || n > 6 {
+	if _, err := fmt.Sscanf(input, "%d", &n); err != nil || n < 1 || n > 5 {
 		fmt.Println("  Invalid field number.")
 		return
 	}
@@ -345,8 +361,6 @@ func (w *wizardState) editByNumber(n int) {
 		w.askHDDir()
 	case 5:
 		w.askLaptopDir()
-	case 6:
-		w.askSoftDelete()
 	}
 }
 
@@ -531,4 +545,59 @@ func (c *Config) HDManagedDir() string {
 // HDStatePath returns the path to the mirrored state file on the HD.
 func (c *Config) HDStatePath() string {
 	return filepath.Join(c.HDRoot(), ".reel-state.jsonl")
+}
+
+// UnmarshalJSON keeps only explicit compatibility with legacy recoverable mode.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type plain Config
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return fmt.Errorf("configuration must be an object")
+	}
+	if v, ok := fields["soft_delete"]; ok && strings.TrimSpace(string(v)) != "true" {
+		return fmt.Errorf("soft_delete is obsolete: remove it or set it to true; permanent deletion is unavailable")
+	}
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*c = Config(p)
+	c.SoftDelete = true
+	return nil
+}
+func safeRelative(p string) bool {
+	if p == "" || filepath.IsAbs(p) {
+		return false
+	}
+	for _, part := range strings.Split(p, "/") {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
+}
+func (c *Config) Validate() error {
+	if !filepath.IsAbs(c.LaptopDir) {
+		return fmt.Errorf("laptop_dir must be absolute")
+	}
+	if !safeRelative(c.HDDir) || filepath.Base(c.HDVolumeName) != c.HDVolumeName || c.HDVolumeName == "" || c.HDVolumeName == ".." {
+		return fmt.Errorf("unsafe backup volume or relative hd_dir")
+	}
+	seen := map[string]bool{}
+	for _, p := range c.Cameras {
+		if p.Name == "" || seen[p.Name] {
+			return fmt.Errorf("missing or duplicate camera profile")
+		}
+		seen[p.Name] = true
+		if !safeRelative(p.MediaPath) || p.VolumeName == "" || p.VolumeName == ".." || filepath.Base(p.VolumeName) != p.VolumeName {
+			return fmt.Errorf("unsafe camera path for %s", p.Name)
+		}
+		if p.VolumeName == c.HDVolumeName {
+			return fmt.Errorf("camera and backup must use independent volumes")
+		}
+	}
+	return nil
 }
