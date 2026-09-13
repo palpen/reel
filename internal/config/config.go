@@ -21,8 +21,8 @@ var ErrWizardAborted = errors.New("wizard aborted by user")
 // CameraProfile describes one camera model's file-naming conventions.
 type CameraProfile struct {
 	Name            string   `json:"name"`
-	VolumeName      string   `json:"volume_name"`  // exact macOS volume name, e.g. "DJI Pocket 3"
-	MediaPath       string   `json:"media_path"`   // path to media files relative to volume root, e.g. "DCIM"
+	VolumeName      string   `json:"volume_name"` // exact macOS volume name, e.g. "DJI Pocket 3"
+	MediaPath       string   `json:"media_path"`  // path to media files relative to volume root, e.g. "DCIM"
 	FilenameRegex   string   `json:"filename_regex"`
 	TimestampSource string   `json:"timestamp_source"`
 	TimestampGroup  string   `json:"timestamp_group"`
@@ -33,11 +33,28 @@ type CameraProfile struct {
 
 // Config is the top-level configuration structure.
 type Config struct {
-	LaptopDir    string          `json:"laptop_dir"`
-	HDVolumeName string          `json:"hd_volume_name"`
-	HDDir        string          `json:"hd_dir"`
-	SoftDelete   bool            `json:"soft_delete"`
-	Cameras      []CameraProfile `json:"cameras"`
+	TransferExtensions []string        `json:"transfer_extensions"`
+	LaptopDir          string          `json:"laptop_dir"`
+	HDVolumeName       string          `json:"hd_volume_name"`
+	HDDir              string          `json:"hd_dir"`
+	SoftDelete         bool            `json:"soft_delete"`
+	Cameras            []CameraProfile `json:"cameras"`
+}
+
+// ShouldTransfer applies to imports and both backup routes, including old state
+// rows. Omitted/null means MP4 only; an explicit empty list transfers nothing.
+// Camera recognition stays separate so clean retains its sibling safety checks.
+func (c *Config) ShouldTransfer(ext string) bool {
+	extensions := c.TransferExtensions
+	if extensions == nil {
+		extensions = []string{"MP4"}
+	}
+	for _, allowed := range extensions {
+		if strings.EqualFold(allowed, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // Dir returns the OS-specific config directory for reel.
@@ -227,6 +244,10 @@ func (w *wizardState) askSoftDelete() {
 }
 
 func (w *wizardState) toConfig(existing *Config) *Config {
+	transferExtensions := []string{"MP4"}
+	if existing != nil {
+		transferExtensions = existing.TransferExtensions
+	}
 	var cameras []CameraProfile
 	if existing != nil && len(existing.Cameras) > 0 {
 		cameras = append(cameras, existing.Cameras...)
@@ -238,11 +259,12 @@ func (w *wizardState) toConfig(existing *Config) *Config {
 		cameras[0].MediaPath = w.mediaPath
 	}
 	return &Config{
-		LaptopDir:    w.laptopDir,
-		HDVolumeName: w.hdVolumeName,
-		HDDir:        w.hdDir,
-		SoftDelete:   w.softDelete,
-		Cameras:      cameras,
+		TransferExtensions: transferExtensions,
+		LaptopDir:          w.laptopDir,
+		HDVolumeName:       w.hdVolumeName,
+		HDDir:              w.hdDir,
+		SoftDelete:         w.softDelete,
+		Cameras:            cameras,
 	}
 }
 

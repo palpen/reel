@@ -18,15 +18,14 @@ $ reel backup
 ✓ 47 backed up, all hashes match
 
 $ reel clean
-Will move to Trash from camera:
-  47 MP4 files (142.3 GB)
-  47 LRF files  (8.1 GB)
-All have verified HD copies (most recent verify: 14s ago).
-Delete 94 files from camera? [y/N]: y
-✓ moved to ~/.Trash/reel-deleted-2026-05-16T19-04-22/
+Held back (47 files):
+  DJI_20260516141822_0001_D.LRF  reason: not tracked in state
+...
+Nothing to delete.
 ```
 
-Four commands. One `y`. Card cleared.
+MP4-only transfers leave unbacked companion files on the card. The sibling safety
+check also holds their MP4s back from cleaning.
 
 ## Commands
 
@@ -41,9 +40,53 @@ Four commands. One `y`. Card cleared.
 | `reel history` | Show recent activity timeline (imports, backups, verifies, cleans) |
 | `reel config` | Re-run the setup wizard with current values pre-filled |
 
-All transfer and delete commands support `--dry-run`. `status` supports `--json`.
+`clean` supports `--dry-run`. `status` supports `--json`.
 
 ## Safety
+
+Transfers (`import`, `backup`, and `direct_backup`) default to MP4 only, including
+files tracked by older versions. Set the top-level `"transfer_extensions": ["MP4"]`
+in `~/.config/reel/config.json` to make this explicit. Add `"WAV"` if you want separate
+audio too. An empty list disables all transfers. Matching is case-insensitive.
+The camera profile's regex still recognizes companion files; its `extensions`
+field does not control transfers.
+
+Excluded files already on backup drives are not automatically removed. Existing
+WAV backups are kept. Camera cleaning still requires every sibling to have its own
+verified backup: skipping LRF/WAV can therefore hold the whole clip on the card.
+Changing transfer preferences never makes an unbacked file safe to delete.
+
+### Recoverable removal of existing LRF backups
+
+`scripts/lrf_quarantine.py` (Python 3.9+, macOS) has separate `plan`, `apply`, and
+`restore` steps. It only selects DJI `.LRF` files with a nonempty matching `.MP4`
+in the same folder. Use a quarantine directory outside the footage folder, on the
+same drive. Run with reel idle.
+
+```bash
+python3 scripts/lrf_quarantine.py plan \
+  --root "/Volumes/MyDrive/Footage" \
+  --quarantine "/Volumes/MyDrive/Reel LRF Recovery/session-1" \
+  --manifest /tmp/lrf-plan.json \
+  --state "$HOME/.config/reel/state.jsonl" \
+  --state "/Volumes/MyDrive/.reel-state.jsonl" \
+  --lock "$HOME/.config/reel/reel.lock"
+# Inspect the manifest before applying. Only include state files that exist.
+python3 scripts/lrf_quarantine.py apply /tmp/lrf-plan.json
+```
+
+The quarantine contains a durable manifest, original state snapshots, a standalone
+restore script, and `RESTORE.txt`. Moves preserve file identity and refuse overwrites
+or cross-volume operations. The tool verifies size, modification time, and inode;
+it does not re-hash the video contents. It checks that other files in the backup
+folder stayed unchanged. Tracked LRF backup paths are cleared while historical
+timestamps and other rows are preserved. Restoration merges those paths back and
+refuses conflicting state edits. Interrupted runs can be resumed or restored using
+the same manifest. Changes to recorded files require review before proceeding.
+
+Quarantined files have no automatic expiry and still occupy disk space. Nothing in
+this tool permanently deletes footage. It does not scan disconnected drives, cloud
+backups, or Time Machine snapshots.
 
 `reel clean` runs eight independent checks before touching anything on the card:
 

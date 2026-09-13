@@ -65,6 +65,9 @@ func RunDirectBackup(args []string) error {
 	// Filter: only files without hd_path
 	var toBackup []camera.File
 	for _, f := range files {
+		if !cfg.ShouldTransfer(f.Ext) {
+			continue
+		}
 		existing := st.GetByParts(f.Profile.Name, f.BaseName, f.Ext)
 		if existing != nil && existing.HDPath != "" {
 			continue
@@ -72,7 +75,7 @@ func RunDirectBackup(args []string) error {
 		toBackup = append(toBackup, f)
 	}
 	if len(toBackup) == 0 {
-		display.Info("All files already backed up to HD.")
+		display.Info("No eligible files to back up (already backed up or excluded by transfer_extensions).")
 		return nil
 	}
 

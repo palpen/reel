@@ -21,6 +21,7 @@ uninstall:
 
 test:
 	go test -race -count=1 ./...
+	python3 -m unittest discover -s scripts -p 'test_*.py'
 
 clean:
 	rm -f $(BIN)

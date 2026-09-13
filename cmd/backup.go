@@ -49,7 +49,7 @@ func RunBackup(args []string) error {
 	// Collect rows with laptop_path and no hd_path
 	var toBackup []*state.Row
 	for _, r := range st.All() {
-		if r.LaptopPath != "" && r.HDPath == "" {
+		if cfg.ShouldTransfer(r.Ext) && r.LaptopPath != "" && r.HDPath == "" {
 			toBackup = append(toBackup, r)
 		}
 	}

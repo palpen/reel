@@ -9,6 +9,44 @@ import (
 	"testing"
 )
 
+func TestTransferExtensions(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		extensions []string
+		allowed    []string
+		blocked    []string
+	}{
+		{"old config defaults to MP4", nil, []string{"MP4", "mp4"}, []string{"LRF", "lrf", "WAV", "MOV", ""}},
+		{"explicit MP4 only", []string{"MP4"}, []string{"MP4", "mp4"}, []string{"LRF", "WAV"}},
+		{"optional audio", []string{"mp4", "wav"}, []string{"MP4", "WAV"}, []string{"LRF"}},
+		{"empty disables transfers", []string{}, nil, []string{"MP4", "LRF", "WAV"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{TransferExtensions: tc.extensions}
+			for _, ext := range tc.allowed {
+				if !cfg.ShouldTransfer(ext) {
+					t.Errorf("expected %s to transfer", ext)
+				}
+			}
+			for _, ext := range tc.blocked {
+				if cfg.ShouldTransfer(ext) {
+					t.Errorf("must not transfer %s", ext)
+				}
+			}
+			// Editing paths must not reset transfer preferences, including [] and nil.
+			edited := newWizardState(cfg).toConfig(cfg)
+			if (edited.TransferExtensions == nil) != (cfg.TransferExtensions == nil) || len(edited.TransferExtensions) != len(cfg.TransferExtensions) {
+				t.Fatal("wizard changed transfer preferences")
+			}
+			for i, ext := range cfg.TransferExtensions {
+				if edited.TransferExtensions[i] != ext {
+					t.Fatal("wizard changed transfer preferences")
+				}
+			}
+		})
+	}
+}
+
 func TestSanitizePath(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {

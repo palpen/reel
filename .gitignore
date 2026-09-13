@@ -1,3 +1,5 @@
 reel
 *.tmp
 .DS_Store
+local-recovery/
+__pycache__/

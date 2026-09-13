@@ -69,6 +69,9 @@ func RunImport(args []string) error {
 	// Filter already-imported
 	var toImport []camera.File
 	for _, f := range files {
+		if !cfg.ShouldTransfer(f.Ext) {
+			continue
+		}
 		existing := st.GetByParts(f.Profile.Name, f.BaseName, f.Ext)
 		if existing != nil && existing.LaptopPath != "" {
 			continue
@@ -76,7 +79,7 @@ func RunImport(args []string) error {
 		toImport = append(toImport, f)
 	}
 	if len(toImport) == 0 {
-		display.Info("All files already imported.")
+		display.Info("No eligible files to import (already imported or excluded by transfer_extensions).")
 		return nil
 	}
 
