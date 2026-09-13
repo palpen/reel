@@ -146,6 +146,27 @@ The completed run recorded these results at
 | APFS | Both complete workflows, restored LRF transfers, collision preservation, all 16 command state-sync failure scenarios, real mounted identity, process lock handoff, and Go/Python locking passed. |
 | exFAT | Real mounted identity and lock tests passed. Exclusive rename is unsupported; publication and recovery refused with original bytes intact. Copying the original into APFS passed. Complete exFAT workflows remain unsupported. |
 
+## Additional PR #2 review fixes
+
+- Existing-copy reuse checks the retained archive directory and the destination
+  file identity again before success. The same check covers a matching publication
+  collision and a freshly published file. Tests substitute directories and files,
+  and alter content while preserving size and mtime, during final volume validation.
+  Another regression substitutes the directory before the existing copy is opened.
+- A removed laptop copy no longer blocks new backups when its selected archive
+  still matches the recorded hash, size, and volume UUID. Command tests cover a
+  missing file or session directory, successful new backups and mirror retries,
+  and refusal for missing, corrupt, wrong-sized, unbound, wrong-volume, outside-root,
+  or symlinked archive copies. Historical paths and identities are preserved.
+- Journal restore creates and syncs its local lock directory safely on a fresh
+  installation. Tests cover first restore and retry without local configuration,
+  plus refusal before movement when directory creation encounters a symlink or
+  sync failure. No configuration or recording history is invented.
+
+The Go race suite, `go vet ./...`, all 19 Python tests, native build, and
+`git diff --check` passed for these changes. These fixture regressions do not
+resolve the exFAT compatibility or physical-drive validation gates below.
+
 ## Release gates still open
 
 The source changes are not a claim that the full release gate has passed.

@@ -127,6 +127,8 @@ Cleaning is recoverable-only. Files move into unique folders under
 record with its original path and hash. These folders have no automatic expiry. Restore with
 `reel restore --journal "/Volumes/Camera/.reel-trash/<entry>/recovery.json"`.
 Restoration refuses existing destination files. In Finder, press Cmd+Shift+. to show the hidden recovery folder.
+Journal restoration also works on a fresh installation: it creates the local lock
+directory without requiring a configuration file or connected backup drive.
 For an LRF first tracked during cleaning, restore records its verified journal hash
 so it can later be imported or backed up when LRF transfers are enabled. If an older
 build already restored that LRF, rerun the same restore command to repair its state.
@@ -151,6 +153,9 @@ its volume UUID to match. A copy on another drive causes an explicit conflict; t
 existing single-backup history is preserved. Unbound legacy records require
 `reel verify --bind-legacy`. Matching, bound records with missing copies are recreated
 from a verified source; changed canonical originals and ambiguous filenames require review.
+Removing a completed laptop copy does not block later backups: Reel checks that
+the recorded archive still matches its canonical hash, size, and selected volume.
+An unavailable or conflicting archive still stops the batch.
 Interrupted `.reel-stage-*` media and `.reel-transfer-*` intents remain in place.
 Legacy `.tmp` files are never swept. No automatic recovery cleanup occurs.
 

@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -56,11 +58,17 @@ func RunBackup(args []string) error {
 
 	hdDir := hdManaged(cfg)
 
-	// Collect rows with laptop_path and no hd_path
+	// Verify completed archives, then collect files that still need copying.
 	var toBackup []*state.Row
 	for _, r := range st.All() {
 		if cfg.ShouldTransfer(r.Ext) && r.LaptopPath != "" {
 			if err := volume.Contains(cfg.LaptopDir, r.LaptopPath); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if err := validateBackupWithoutSource(cfg, hdIdentity, r); err != nil {
+						return fmt.Errorf("laptop copy unavailable at %s: %w", r.LaptopPath, err)
+					}
+					continue
+				}
 				return err
 			}
 			ok, err := validatedBackup(cfg, hdIdentity, r.LaptopPath, r)

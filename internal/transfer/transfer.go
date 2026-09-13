@@ -101,6 +101,9 @@ func CopyChecked(src, destDir, filename string, recordedAt time.Time, expectedSH
 				return nil, err
 			}
 		}
+		if err = checkDestination(dir, filename, info, computed); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -207,6 +210,11 @@ func CopyChecked(src, destDir, filename string, recordedAt time.Time, expectedSH
 			if e != nil {
 				return nil, e
 			}
+			info, e := winner.Stat()
+			if e != nil {
+				winner.Close()
+				return nil, e
+			}
 			h, size, e := hashHandle(winner)
 			winner.Close()
 			if e != nil {
@@ -220,6 +228,9 @@ func CopyChecked(src, destDir, filename string, recordedAt time.Time, expectedSH
 					if e = validate(); e != nil {
 						return nil, e
 					}
+				}
+				if e = checkDestination(dir, filename, info, computed); e != nil {
+					return nil, e
 				}
 				return result, nil
 			}
@@ -238,9 +249,6 @@ func CopyChecked(src, destDir, filename string, recordedAt time.Time, expectedSH
 	if !os.SameFile(stageInfo, info) {
 		return nil, fmt.Errorf("published identity changed: %s", dest)
 	}
-	if err = stable(published, info, computed); err != nil {
-		return nil, err
-	}
 	if err = dir.Sync(); err != nil {
 		return nil, err
 	}
@@ -252,7 +260,41 @@ func CopyChecked(src, destDir, filename string, recordedAt time.Time, expectedSH
 			return nil, err
 		}
 	}
+	if err = checkDestination(dir, filename, info, computed); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+// The returned pathname must still name the file we verified, even when no
+// rename was needed. Volume checks alone cannot detect same-volume substitution.
+func checkDestination(dir *os.File, name string, before os.FileInfo, expected string) error {
+	if err := safefs.CheckDir(dir); err != nil {
+		return err
+	}
+	current, err := safefs.OpenAt(dir, name, unix.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer current.Close()
+	if err := stable(current, before, expected); err != nil {
+		return err
+	}
+	// Hashing can be slow: also detect replacement of the directory entry while
+	// the verified descriptor was being read.
+	named, err := safefs.OpenAt(dir, name, unix.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer named.Close()
+	info, err := named.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(before, info) {
+		return fmt.Errorf("destination identity changed: %s", named.Name())
+	}
+	return safefs.CheckDir(dir)
 }
 
 func hashHandle(f *os.File) (string, int64, error) {

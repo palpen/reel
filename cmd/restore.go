@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/pspenano/reel/internal/lockfile"
+	"github.com/pspenano/reel/internal/safefs"
 	"github.com/pspenano/reel/internal/state"
 	"github.com/pspenano/reel/internal/trash"
 	"path/filepath"
@@ -26,11 +27,20 @@ func RunRestore(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Journals also work on a fresh installation with no local config or state.
+	local, err := safefs.OpenDir(dir, true)
+	if err != nil {
+		return err
+	}
+	defer local.Close()
 	lk, err := lockfile.AcquireExclusive(filepath.Join(dir, "reel.lock"))
 	if err != nil {
 		return err
 	}
 	defer lk.Release()
+	if err := safefs.CheckDir(local); err != nil {
+		return err
+	}
 	card, err := lockfile.AcquireExclusive(filepath.Join(r.Volume, "reel.lock"))
 	if err != nil {
 		return err

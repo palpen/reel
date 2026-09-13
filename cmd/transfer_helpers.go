@@ -89,23 +89,8 @@ func validatedCopy(src, dst, canonical string) (bool, error) {
 // A canonical copy only satisfies a backup request on the selected archive.
 // Refuse old-drive history rather than silently rebinding the single HD record.
 func validatedBackup(cfg *config.Config, id volume.Identity, src string, row *state.Row) (bool, error) {
-	if err := checkVolume(id); err != nil {
+	if err := validateBackupIdentity(cfg, id, row); err != nil {
 		return false, err
-	}
-	if row.HDPath != "" {
-		rel, err := filepath.Rel(hdManaged(cfg), row.HDPath)
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return false, fmt.Errorf("backup identity conflict: recorded path %s is outside selected archive %s; existing history was preserved", row.HDPath, hdManaged(cfg))
-		}
-		if row.HDVolumeUUID == "" {
-			return false, fmt.Errorf("backup identity is unbound for %s; verify the intended drive with reel verify --bind-legacy", row.HDPath)
-		}
-		if row.HDVolumeUUID != id.UUID {
-			return false, fmt.Errorf("backup identity conflict: recorded volume for %s differs from selected drive; existing history was preserved", row.HDPath)
-		}
-		if err := volume.Contains(hdManaged(cfg), row.HDPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return false, err
-		}
 	}
 	ok, err := validatedCopy(src, row.HDPath, row.SHA256)
 	if err != nil {
@@ -115,6 +100,47 @@ func validatedBackup(cfg *config.Config, id volume.Identity, src string, row *st
 		return false, err
 	}
 	return ok, nil
+}
+
+// A removed laptop copy does not invalidate a complete archive. Its recorded
+// identity and bytes still have to pass all checks before other backups proceed.
+func validateBackupWithoutSource(cfg *config.Config, id volume.Identity, row *state.Row) error {
+	if err := validateBackupIdentity(cfg, id, row); err != nil {
+		return err
+	}
+	if row.HDPath == "" || row.SHA256 == "" {
+		return fmt.Errorf("no canonical archive copy is recorded")
+	}
+	hash, size, err := transfer.HashFile(row.HDPath)
+	if err != nil {
+		return fmt.Errorf("verify archive %s: %w", row.HDPath, err)
+	}
+	if hash != row.SHA256 || size != row.SizeBytes {
+		return fmt.Errorf("tracked destination conflict: %s", row.HDPath)
+	}
+	return checkVolume(id)
+}
+
+func validateBackupIdentity(cfg *config.Config, id volume.Identity, row *state.Row) error {
+	if err := checkVolume(id); err != nil {
+		return err
+	}
+	if row.HDPath != "" {
+		rel, err := filepath.Rel(hdManaged(cfg), row.HDPath)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("backup identity conflict: recorded path %s is outside selected archive %s; existing history was preserved", row.HDPath, hdManaged(cfg))
+		}
+		if row.HDVolumeUUID == "" {
+			return fmt.Errorf("backup identity is unbound for %s; verify the intended drive with reel verify --bind-legacy", row.HDPath)
+		}
+		if row.HDVolumeUUID != id.UUID {
+			return fmt.Errorf("backup identity conflict: recorded volume for %s differs from selected drive; existing history was preserved", row.HDPath)
+		}
+		if err := volume.Contains(hdManaged(cfg), row.HDPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateCameraBatch(files []camera.File) error {
