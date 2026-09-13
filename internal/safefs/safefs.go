@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/pspenano/reel/internal/fault"
 	"golang.org/x/sys/unix"
 	"io"
 	"os"
@@ -40,12 +41,7 @@ func OpenDir(path string, create bool) (*os.File, error) {
 		if part == "" {
 			continue
 		}
-		next, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if e == unix.ENOENT && create {
-			if e = unix.Mkdirat(fd, part, 0700); e == nil || e == unix.EEXIST {
-				next, e = unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-			}
-		}
+		next, e := openDirectoryAt(fd, part, create)
 		unix.Close(fd)
 		if e != nil {
 			return nil, fmt.Errorf("open directory %s: %w", abs, e)
@@ -136,6 +132,10 @@ func FreshDir(parent *os.File, prefix string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := syncDirectory(int(parent.Fd())); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
 	return os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name)), nil
 }
 
@@ -220,12 +220,7 @@ func OpenBeneath(root *os.File, rel string, create bool) (*os.File, error) {
 			unix.Close(fd)
 			return nil, err
 		}
-		next, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if e == unix.ENOENT && create {
-			if e = unix.Mkdirat(fd, part, 0700); e == nil || e == unix.EEXIST {
-				next, e = unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-			}
-		}
+		next, e := openDirectoryAt(fd, part, create)
 		unix.Close(fd)
 		if e != nil {
 			return nil, e
@@ -242,4 +237,31 @@ func OpenBeneath(root *os.File, rel string, create bool) (*os.File, error) {
 		}
 	}
 	return os.NewFile(uintptr(fd), filepath.Join(root.Name(), rel)), nil
+}
+
+// Persist the containing directory before exposing a child for mutation. Also
+// sync existing children on a create walk: they may remain from a failed attempt.
+func openDirectoryAt(parent int, name string, create bool) (int, error) {
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) && create {
+		if err = unix.Mkdirat(parent, name, 0700); err == nil || errors.Is(err, unix.EEXIST) {
+			fd, err = unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		}
+	}
+	if err != nil {
+		return -1, err
+	}
+	if create {
+		if err = syncDirectory(parent); err != nil {
+			unix.Close(fd)
+			return -1, err
+		}
+	}
+	return fd, nil
+}
+func syncDirectory(fd int) error {
+	if err := fault.Check("directory-sync"); err != nil {
+		return err
+	}
+	return unix.Fsync(fd)
 }

@@ -63,7 +63,7 @@ func RunBackup(args []string) error {
 			if err := volume.Contains(cfg.LaptopDir, r.LaptopPath); err != nil {
 				return err
 			}
-			ok, err := validatedCopy(r.LaptopPath, r.HDPath, r.SHA256)
+			ok, err := validatedBackup(cfg, hdIdentity, r.LaptopPath, r)
 			if err != nil {
 				return err
 			}
@@ -73,6 +73,9 @@ func RunBackup(args []string) error {
 		}
 	}
 	if len(toBackup) == 0 {
+		if err := mirrorStateToHD(cfg, st); err != nil {
+			return fmt.Errorf("verified skips; required mirror failed: %w", err)
+		}
 		display.Info("Nothing to back up.")
 		return nil
 	}

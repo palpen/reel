@@ -103,7 +103,7 @@ func RunDirectBackup(args []string) error {
 			if existing.CameraPath != "" && filepath.Clean(existing.CameraPath) != filepath.Clean(f.FullPath) {
 				return fmt.Errorf("recording path conflicts with existing identity: %s", f.FullPath)
 			}
-			ok, err := validatedCopy(f.FullPath, existing.HDPath, existing.SHA256)
+			ok, err := validatedBackup(cfg, hdIdentity, f.FullPath, existing)
 			if err != nil {
 				return err
 			}
@@ -114,6 +114,9 @@ func RunDirectBackup(args []string) error {
 		toBackup = append(toBackup, f)
 	}
 	if len(toBackup) == 0 {
+		if err := mirrorStateToHD(cfg, st); err != nil {
+			return fmt.Errorf("verified skips; required mirror failed: %w", err)
+		}
 		display.Info("No eligible files to back up (already backed up or excluded by transfer_extensions).")
 		return nil
 	}

@@ -462,3 +462,38 @@ func TestCompetingProcessCopiesNeverReplaceWinner(t *testing.T) {
 		t.Fatal("successful copy was overwritten")
 	}
 }
+
+func TestNestedDestinationSyncFailurePreservesSource(t *testing.T) {
+	root := realTempDir(t)
+	src := writeTestFile(t, root, "source.MP4", []byte("original"))
+	parent := filepath.Join(root, "new-session")
+	dest := filepath.Join(parent, "footage")
+	injected := false
+	fault.Hook = func(step string) error {
+		if step == "directory-sync" {
+			if _, err := os.Stat(parent); err == nil {
+				injected = true
+				return fmt.Errorf("parent sync failed")
+			}
+		}
+		return nil
+	}
+	defer func() { fault.Hook = nil }()
+	if _, err := transfer.Copy(src, dest, "clip.MP4", time.Time{}, ""); err == nil {
+		t.Fatal("unsynced parent accepted")
+	}
+	if !injected {
+		t.Fatal("did not reach new parent barrier")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatal("descended before parent was synced")
+	}
+	data, err := os.ReadFile(src)
+	if err != nil || string(data) != "original" {
+		t.Fatal("source changed")
+	}
+	fault.Hook = nil
+	if _, err := transfer.Copy(src, dest, "clip.MP4", time.Time{}, ""); err != nil {
+		t.Fatal("retry failed", err)
+	}
+}

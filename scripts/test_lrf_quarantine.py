@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+import os
 
 import lrf_quarantine as q
 
@@ -13,6 +15,7 @@ class QuarantineTests(unittest.TestCase):
         self.base = Path(self.tmp.name).resolve()
         self.root = self.base/'backup'
         self.root.mkdir()
+        (self.root/'.reel-protocol.json').write_text(q.PROTOCOL)
         self.recovery = self.base/'recovery'
         self.lrf = self.root/'DJI_20260912123456_0001_D.LRF'
         self.mp4 = self.lrf.with_suffix('.MP4')
@@ -144,6 +147,128 @@ class QuarantineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             q.execute(p)
         self.assertTrue(self.lrf.exists())
+
+    def test_subtree_uses_managed_archive_lock(self):
+        selected = self.root/'camera-session'
+        selected.mkdir()
+        lrf = selected/self.lrf.name
+        mp4 = selected/self.mp4.name
+        self.lrf.rename(lrf)
+        self.mp4.rename(mp4)
+        p = q.plan(selected, self.recovery, [], None)
+        self.assertEqual(p['archive_root'], str(self.root))
+        with q.locked(self.root/'.reel-archive.lock'):
+            with self.assertRaises(BlockingIOError):
+                q.execute(p)
+        self.assertTrue(lrf.exists())
+        self.assertFalse((selected/'.reel-archive.lock').exists())
+        # An explicit subtree cannot override the managed ancestor.
+        with self.assertRaises(ValueError):
+            q.plan(selected, self.recovery, [], None, selected)
+        q.execute(p)
+        q.execute(p, restore=True)
+        self.assertEqual(lrf.read_bytes(), b'proxy contents')
+
+    def test_archive_root_must_be_unambiguous(self):
+        (self.root/'.reel-protocol.json').unlink()
+        with self.assertRaisesRegex(ValueError, '--archive-root'):
+            self.plan()
+        p = q.plan(self.root, self.recovery, [], None, self.root)
+        self.assertEqual(p['archive_root'], str(self.root))
+        q.execute(p)
+        # A second marker makes ancestor selection ambiguous, even explicitly.
+        (self.base/'.reel-protocol.json').write_text(q.PROTOCOL)
+        with self.assertRaisesRegex(ValueError, 'Ambiguous'):
+            q.execute(p, restore=True)
+
+    def test_legacy_manifest_discovers_archive_ancestor(self):
+        p = self.plan()
+        del p['archive_root']
+        q.execute(p)
+        q.execute(p, restore=True)
+        self.assertEqual(self.lrf.read_bytes(), b'proxy contents')
+
+    def test_recovery_substitution_before_move_stops_without_moving_media(self):
+        p = self.plan()
+        moved_directory = self.base/'retained-recovery'
+        real_move = q.exclusive_move
+
+        def substitute(src, dst, **handles):
+            self.assertIsNotNone(handles.get('destination_fd'))
+            self.recovery.rename(moved_directory)
+            Path(dst).parent.mkdir(parents=True)
+            return real_move(src, dst, **handles)
+
+        with mock.patch.object(q, 'exclusive_move', side_effect=substitute):
+            with self.assertRaisesRegex(ValueError, 'retained-recovery'):
+                q.execute(p)
+        self.assertEqual(self.lrf.read_bytes(), b'proxy contents')
+        self.assertTrue((moved_directory/'manifest.json').is_file())
+        self.assertFalse(Path(p['entries'][0]['destination']).exists())
+
+    def test_recovery_substitution_after_move_keeps_media_with_manifest(self):
+        p = self.plan()
+        original_state = self.state.read_bytes()
+        retained = self.base/'retained-recovery'
+        destination = Path(p['entries'][0]['destination'])
+        real_sync = os.fsync
+        substituted = False
+
+        def substitute(fd):
+            nonlocal substituted
+            if not substituted and not self.lrf.exists() and destination.exists():
+                self.recovery.rename(retained)
+                destination.parent.mkdir(parents=True)
+                substituted = True
+            return real_sync(fd)
+
+        with mock.patch.object(q.os, 'fsync', side_effect=substitute):
+            with self.assertRaisesRegex(ValueError, 'retained-recovery'):
+                q.execute(p)
+        self.assertTrue(substituted)
+        self.assertEqual((retained/'files'/self.lrf.name).read_bytes(), b'proxy contents')
+        self.assertTrue((retained/'manifest.json').is_file())
+        self.assertTrue((retained/'restore_lrf.py').is_file())
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.state.read_bytes(), original_state)
+
+    def test_artifact_creation_uses_retained_recovery_directory(self):
+        p = self.plan()
+        retained = self.base/'retained-recovery'
+        real_artifact = q.artifact
+        changed = False
+
+        def substitute(path, data, **kwargs):
+            nonlocal changed
+            if Path(path).name == 'manifest.json' and kwargs.get('create', True) and not changed:
+                self.recovery.rename(retained)
+                self.recovery.mkdir()
+                changed = True
+            return real_artifact(path, data, **kwargs)
+
+        with mock.patch.object(q, 'artifact', side_effect=substitute):
+            with self.assertRaisesRegex(ValueError, 'Directory changed'):
+                q.execute(p)
+        self.assertEqual(self.lrf.read_bytes(), b'proxy contents')
+        self.assertTrue((retained/'manifest.json').is_file())
+        self.assertFalse((self.recovery/'manifest.json').exists())
+
+    def test_restore_refuses_replaced_recovery_parent(self):
+        p = self.plan()
+        q.execute(p)
+        retained = self.base/'retained-recovery'
+        real_move = q.exclusive_move
+
+        def substitute(src, dst, **handles):
+            self.recovery.rename(retained)
+            Path(src).parent.mkdir(parents=True)
+            return real_move(src, dst, **handles)
+
+        with mock.patch.object(q, 'exclusive_move', side_effect=substitute):
+            with self.assertRaisesRegex(ValueError, 'retained-recovery'):
+                q.execute(p, restore=True)
+        self.assertFalse(self.lrf.exists())
+        self.assertEqual((retained/'files'/self.lrf.name).read_bytes(), b'proxy contents')
 
 
 if __name__ == '__main__':

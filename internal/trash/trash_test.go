@@ -230,3 +230,39 @@ func TestRecoveryFailuresNeverDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoveryRootSyncFailureStopsBeforeMovement(t *testing.T) {
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	src := filepath.Join(root, "clip.MP4")
+	if err := os.WriteFile(src, []byte("preserve"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	fault.Hook = func(step string) error {
+		if step == "directory-sync" {
+			calls++
+			return syscall.EIO
+		}
+		return nil
+	}
+	defer func() { fault.Hook = nil }()
+	for i := 0; i < 2; i++ {
+		if _, err := MoveOnVolume(src, root, time.Now()); err == nil {
+			t.Fatal("sync failure accepted")
+		}
+		data, err := os.ReadFile(src)
+		if err != nil || string(data) != "preserve" {
+			t.Fatal("original moved before root sync")
+		}
+	}
+	if calls != 2 {
+		t.Fatal("retry failed to sync existing recovery root", calls)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".reel-trash")); err != nil {
+		t.Fatal("did not exercise root creation", err)
+	}
+	fault.Hook = nil
+	if _, err := MoveOnVolume(src, root, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
