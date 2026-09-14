@@ -88,8 +88,19 @@ func TestMountedVolumeCapabilities(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(archive, "clip.MP4")); !os.IsNotExist(err) {
 			t.Fatalf("failed publication exposed destination media: %v", err)
 		}
-		if _, err := trash.MoveOnVolume(source, probe, time.Now()); err == nil {
-			t.Fatal("unsupported camera reported successful recovery movement")
+		recovered, err := trash.MoveOnVolume(source, probe, time.Now())
+		if err != nil {
+			t.Fatal("exFAT recovery failed", err)
+		}
+		if _, err := os.Stat(source); !os.IsNotExist(err) {
+			t.Fatal("source not moved", err)
+		}
+		journal := filepath.Join(filepath.Dir(recovered), "recovery.json")
+		if err := trash.Restore(journal); err != nil {
+			t.Fatal(err)
+		}
+		if err := trash.Restore(journal); err != nil {
+			t.Fatal("restore retry", err)
 		}
 		assertOriginal()
 		// The unsupported card can still be read into a supported desktop archive.
@@ -111,9 +122,9 @@ func TestMountedVolumeCapabilities(t *testing.T) {
 			t.Fatalf("cross-filesystem copy failed: %q %v", data, err)
 		}
 		assertOriginal()
-		t.Logf("unsupported exclusive rename; publication/recovery refused with original intact: %v", capabilityErr)
+		t.Logf("exclusive archive publication refused; verified-copy recovery and restore passed: %v", capabilityErr)
 	}
-	report, err := json.Marshal(map[string]bool{"exclusive_rename": capabilityErr == nil})
+	report, err := json.Marshal(map[string]bool{"exclusive_rename": capabilityErr == nil, "recoverable_clean": true})
 	if err != nil {
 		t.Fatal(err)
 	}

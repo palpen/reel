@@ -25,6 +25,23 @@ func commands(t *testing.T) *commandFixture {
 		t.Fatal(e)
 	}
 	f := &commandFixture{root: root, card: filepath.Join(root, "card"), hd: filepath.Join(root, "hd"), local: filepath.Join(root, "config")}
+	// Mounted-image validation puts the camera and archive on different actual
+	// filesystems. Production identity resolution is tested separately.
+	for _, target := range []struct {
+		env  string
+		path *string
+	}{
+		{"REEL_TEST_CARD_ROOT", &f.card}, {"REEL_TEST_ARCHIVE_ROOT", &f.hd},
+	} {
+		if mount := os.Getenv(target.env); mount != "" {
+			p, err := os.MkdirTemp(mount, "reel-command-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(p) })
+			*target.path = filepath.Join(p, filepath.Base(*target.path))
+		}
+	}
 	for _, p := range []string{f.card, f.hd, f.local, filepath.Join(root, "laptop")} {
 		if e := os.Mkdir(p, 0700); e != nil {
 			t.Fatal(e)

@@ -7,3 +7,5 @@ import "os"
 // Non-macOS builds support disposable primitive tests; volume.Resolve rejects
 // production CLI mutations without macOS DiskManagement.
 func SupportedFS(dir *os.File) error { return nil }
+
+func RecoveryCopies(dir *os.File) (bool, error) { return false, SupportedFS(dir) }
