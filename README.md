@@ -5,9 +5,10 @@ verifies copies with SHA-256, and moves backed-up camera files into journaled
 recovery after confirmation. Recovery retains the media on the card and does not
 free card space.
 
-**Current filesystem limitation:** importing from exFAT into APFS works. Cleaning
-an exFAT camera card or publishing to an exFAT archive is currently unavailable;
-these operations refuse safely. See [filesystem support and validation](#filesystems-and-release-validation).
+APFS and HFS+ archives support transfer, verification, and metadata operations.
+exFAT camera cards support recoverable clean and restore through verified copies.
+Publishing new archive media to exFAT still requires unsupported exclusive rename
+and is refused. See [filesystem support and validation](#filesystems-and-release-validation).
 
 On supported filesystems, the usual workflow is:
 
@@ -137,7 +138,18 @@ Cleaning is recoverable-only. Files move into unique folders under
 `<camera-volume>/.reel-trash/`. Each folder contains the media and a `recovery.json`
 record with its original path and hash. These folders have no automatic expiry. Restore with
 `reel restore --journal "/Volumes/Camera/.reel-trash/<entry>/recovery.json"`.
-Restoration refuses existing destination files. In Finder, press Cmd+Shift+. to show the hidden recovery folder.
+Restoration refuses destination conflicts, including case-insensitive collisions.
+On exFAT, clean creates the recovery file exclusively, flushes and independently
+verifies it, revalidates the camera and backup, and only then removes the camera
+entry. This needs temporary free space for one file. Partial copies and journals
+are retained on failure; retrying clean uses a fresh recovery folder.
+exFAT restore creates the destination exclusively and **keeps the recovery copy**.
+An interrupted restore can append the missing suffix only when its durable
+`restore.json` receipt identifies that file and every existing byte matches recovery.
+A replaced file, changed prefix, or missing/damaged receipt is a conflict. In the
+small creation-before-receipt interruption window, preserve the destination under
+another name before retrying; Reel will not guess that an unowned file is disposable.
+In Finder, press Cmd+Shift+. to show the hidden recovery folder.
 Journal restoration also works on a fresh installation: it creates the local lock
 directory without requiring a configuration file or connected backup drive.
 For an LRF first tracked during cleaning, restore records its verified journal hash
@@ -222,27 +234,27 @@ these archives: old releases do not honor the new locking and preservation proto
 
 ## Filesystems and release validation
 
-Mutations require working flock, exclusive rename, file sync, and directory sync.
-Reel checks APFS/exFAT capabilities before moving media and refuses unsupported
-operations. On the tested macOS 26.5.2 host, APFS passes these checks but exFAT
-rejects exclusive rename: **cleaning an exFAT camera card and publishing to an
-exFAT archive are currently unavailable.** Reading an exFAT card into an APFS
-archive works. `.reel-capability-*` directories contain
-owned empty probe files. Keep lockfiles in place; unlinking them breaks coordination.
-Network filesystems are unsupported.
+Reel supports APFS, HFS+, and exFAT for locking and metadata. APFS/HFS+ media
+publication and recovery moves require a successful exclusive-rename probe.
+exFAT recoverable cleaning explicitly uses a copy/verify/remove protocol, recorded
+in version 2 recovery journals. It never falls back from a failed rename. Recovery
+journals and copies require file/directory sync and macOS `F_FULLFSYNC`; errors stop
+source removal. New media publication to an exFAT archive remains unavailable.
+`.reel-capability-*` directories contain owned empty probe files. Keep lockfiles in
+place; unlinking them breaks coordination. Network filesystems are unsupported.
 
-The fixture suites cover collisions, aliases, directory/file replacement during
-copy verification, interrupted copying, lock handoff, state failures and retries,
-backups after laptop-copy removal, quarantine attacks, and clean/restore workflows
-including restoration on a fresh installation. They do not prove removable-drive
-durability or physical power-loss behavior. The Go 1.22/current × Python 3.9/3.14
-matrix passed for the latest code fixes (`a4d9faf`):
-[PR CI run](https://github.com/palpen/reel/actions/runs/34788637936).
-Disposable-image tests confirm APFS workflows and safe rejection on exFAT;
-exFAT write support and the remaining
-physical-drive validation are still release limitations. Run
-`python3 scripts/validate_disk_images.py` on macOS with DiskManagement access to
-repeat those checks. See [the release validation record](docs/REMEDIATION_VALIDATION.md).
+The fixture suites cover eligibility, collisions, aliases, file and directory
+replacement, interrupted copies, process locking, state failures, and retries.
+The disposable-image harness runs complete workflows with an exFAT camera and an
+HFS+ archive, tests actual full-volume failure, and force-detaches/reattaches its
+exFAT image at recovery and restore checkpoints. Image tests do not establish
+physical independence of drives or physical power-loss durability.
+
+Run `python3 scripts/validate_disk_images.py` on macOS with DiskManagement access.
+`--filesystem ExFAT` includes an HFS+ archive; APFS and HFS+ can also be selected.
+Images and logs are retained under `/private/tmp`, and the harness detaches its
+images on exit. See [exFAT/HFS+ validation](docs/EXFAT_RECOVERY.md) and the
+[earlier remediation record](docs/REMEDIATION_VALIDATION.md).
 
 Run the local checks with:
 

@@ -3,6 +3,7 @@ package trash
 import (
 	"encoding/json"
 	"github.com/pspenano/reel/internal/fault"
+	"github.com/pspenano/reel/internal/safefs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +30,16 @@ func TestMoveOnVolumeRecoverableAndCollisionFree(t *testing.T) {
 			t.Fatal(err)
 		}
 		after, err := os.Stat(dest)
-		if err != nil || !os.SameFile(before, after) {
+		dir, e := safefs.OpenDir(volume, false)
+		if e != nil {
+			t.Fatal(e)
+		}
+		copies, e := safefs.RecoveryCopies(dir)
+		dir.Close()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if err != nil || (!copies && !os.SameFile(before, after)) {
 			t.Fatal("move did not preserve file identity")
 		}
 		if _, err := os.Stat(src); !os.IsNotExist(err) {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/pspenano/reel/internal/display"
 	"github.com/pspenano/reel/internal/lockfile"
+	"github.com/pspenano/reel/internal/safefs"
 	"github.com/pspenano/reel/internal/state"
 	"github.com/pspenano/reel/internal/trash"
 	"github.com/pspenano/reel/internal/volume"
@@ -138,6 +139,18 @@ func RunClean(args []string) error {
 
 	display.Print("\nCamera: %s; backup: %s (%s)", dc.VolumePath, hdRoot(cfg), hdIdentity.UUID)
 	display.Print("Files will move to %s. Recovery occupies card space and never expires.", filepath.Join(dc.VolumePath, ".reel-trash"))
+	cardDir, err := safefs.OpenDir(dc.VolumePath, false)
+	if err != nil {
+		return err
+	}
+	copies, err := safefs.RecoveryCopies(cardDir)
+	cardDir.Close()
+	if err != nil {
+		return err
+	}
+	if copies {
+		display.Print("exFAT recovery uses verified copies and needs temporary free space for one file. Restore retains the recovery copy.")
+	}
 
 	if *dryRun {
 		display.Print("\n--dry-run: no files deleted.")
@@ -196,7 +209,17 @@ func executeCleanPlan(toDelete []cleanCandidate, st *state.Store, volume string,
 				return deleted, err
 			}
 		}
-		dest, delErr := trash.MoveOnVolume(d.file.FullPath, volume, deleteTs)
+		dest, delErr := trash.MoveChecked(d.file.FullPath, volume, deleteTs, func() error {
+			for _, snapshot := range d.snapshots {
+				if err := snapshot.check(); err != nil {
+					return err
+				}
+			}
+			if d.validate != nil {
+				return d.validate()
+			}
+			return nil
+		})
 		if dest != "" {
 			display.Print("  Recoverable: %s", dest)
 		}
